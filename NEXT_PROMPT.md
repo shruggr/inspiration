@@ -1,217 +1,266 @@
-# Next Session: IPLD Multihash Integration Implementation
+# Next Development Session
 
-## Context
+## Quick Start
 
-We've completed the foundational storage architecture (KVStore, IndexNode, Metadata, Cache) and designed IPLD multihash integration for IPFS distribution.
+**Project Status:** Message fetching complete ✅ | Ready for subtree processing ⏳
 
-**READ THESE FILES FIRST:**
-1. **[PROGRESS.md](PROGRESS.md)** - Complete project history and current status
-2. **[IPLD_INTEGRATION_PLAN.md](IPLD_INTEGRATION_PLAN.md)** - Detailed implementation plan with code examples
-3. **[IPLD_RESEARCH_FINDINGS.md](IPLD_RESEARCH_FINDINGS.md)** - Research on multihash, IPLD, DAG-CBOR
+**Start with this prompt:**
 
----
+```
+I need to implement subtree processing.
 
-## What We're Building
+Context:
+- SubtreeMessage JSON format: {Hash, URL, PeerID, ClientName}
+- Fetcher functions are complete with smart optimization
+- All storage infrastructure (KVStore, Cache, TreeBuilder, MerkleBuilder) is ready
+- P2P listener is running and receiving subtree messages
 
-We're implementing IPLD multihash integration to enable IPFS distribution of our Bitcoin transaction index database. This involves:
-
-1. **New metadata schema** with blocks + subtrees tables (1:many relationship)
-2. **Multihash wrapper types** for self-describing hashes
-3. **Variable-length KVStore keys** to support multihash
-4. **IPLD Bitcoin merkle trees** stored as 64-byte nodes
-5. **Efficient merkle proof construction** by walking IPLD tree structure
-
-**Key benefit:** Our entire KV database can be distributed via IPFS while maintaining Bitcoin-compatible merkle tree verification.
-
----
-
-## Implementation Phases
-
-### Phase 1: Update Metadata Store ⏳
-
-**Goal:** New SQLite schema with blocks + subtrees tables
-
-**Details:** See [IPLD_INTEGRATION_PLAN.md - Phase 1](IPLD_INTEGRATION_PLAN.md#phase-1-update-metadata-store-)
-
-**Key changes:**
-- New Go types: `BlockMeta` (with `TxCount`, `Status`), `SubtreeMeta`
-- SQL schema with foreign key: `subtrees.merkle_root → blocks.merkle_root`
-- New methods: `PutBlock()`, `GetSubtrees()`, `MarkOrphan()`, `CleanupOrphans()`
-- Transaction support for atomic block + subtrees insert
-
-**Files to modify:**
-- `metadata/store.go`
-- `metadata/sqlite/sqlite.go`
-- New: `metadata/sqlite/sqlite_test.go`
-
----
-
-### Phase 2: Create Multihash Wrapper Package ⏳
-
-**Goal:** Type-safe hash wrappers for different categories
-
-**Details:** See [IPLD_INTEGRATION_PLAN.md - Phase 2](IPLD_INTEGRATION_PLAN.md#phase-2-create-multihash-wrapper-package-)
-
-**New types:**
-- `IndexHash` - BLAKE3 multihash for index structures
-- `MerkleHash` - dbl-sha2-256 multihash for Bitcoin merkle trees
-
-**Key functions:**
-- `NewIndexHash(data []byte)` - Hash with BLAKE3
-- `NewMerkleHash(hash [32]byte)` - Wrap existing Bitcoin hash
-- `Verify(data []byte)` - Verify hash matches data
-- `Raw() [32]byte` - Extract raw hash from multihash
-
-**Files to create:**
-- `multihash/hash.go`
-- `multihash/hash_test.go`
-
----
-
-### Phase 3: Update KVStore for Variable-Length Keys ⏳
-
-**Goal:** Support multihash keys (34 bytes) instead of fixed 32-byte hashes
-
-**Details:** See [IPLD_INTEGRATION_PLAN.md - Phase 3](IPLD_INTEGRATION_PLAN.md#phase-3-update-kvstore-for-variable-length-keys-)
-
-**Interface change:**
-```go
-// OLD: type Hash = chainhash.Hash
-Put(ctx context.Context, key Hash, value []byte) error
-
-// NEW:
-Put(ctx context.Context, key []byte, value []byte) error
+See PROGRESS.md for complete context. Let's start by implementing the subtree
+processing flow in the main event loop.
 ```
 
-**Files to modify:**
-- `kvstore/store.go`
-- `kvstore/memory/memory.go`
-- `kvstore/badger/badger.go`
+---
+
+## Current Understanding
+
+### What We Have ✅
+
+**Message Fetching** - Three optimized functions:
+1. `FetchSubtreeTxIDs(ctx, baseURL, subtreeHash)` → Get txid list (lightweight)
+2. `FetchTransactionsByTxID(ctx, baseURL, txIDs)` → Fetch specific txs (general endpoint)
+3. `FetchSubtreeTransactions(ctx, baseURL, subtreeHash, txIDs)` → Fetch from subtree (optimized)
+4. `FetchMissingSubtreeTransactions(...)` → Smart helper (picks 2 or 3 based on cache hit rate)
+
+**Storage Infrastructure:**
+- KVStore: BadgerDB with multihash support
+- IndexTermCache: LRU cache for parsed transactions
+- MetadataStore: SQLite for block/subtree tracking
+- TreeBuilder: Builds index trees (BLAKE3)
+- MerkleBuilder: Builds IPLD merkle trees (dbl-sha2-256)
+
+**P2P Layer:**
+- Receiving JSON messages on channels
+- Three topics: block, subtree, node_status
+- Currently just logging messages
+
+### What We Need ⏳
+
+**Subtree Processing Flow:**
+
+```go
+// Main event loop receives subtreeData from P2P
+case subtreeData := <-subtreeCh:
+    // 1. Unmarshal JSON to SubtreeMessage struct
+    var msg SubtreeMessage
+    json.Unmarshal(subtreeData, &msg)
+
+    // 2. Fetch txid list (lightweight discovery)
+    txIDs := FetchSubtreeTxIDs(ctx, msg.URL, msg.Hash)
+
+    // 3. Check which txs we already have in KVStore
+    missingTxIDs := findMissingTxIDs(txIDs, kvstore)
+
+    // 4. Smart fetch missing transactions
+    txData := FetchMissingSubtreeTransactions(ctx, msg.URL, msg.Hash, txIDs, missingTxIDs)
+
+    // 5. Process each transaction
+    for txid, rawTx := range transactions {
+        // a. Check cache for parsed terms
+        terms := cache.Get(txid)
+        if terms == nil {
+            // b. Parse tx and extract index terms
+            terms = indexer.Index(tx)
+            cache.Put(txid, terms)
+        }
+
+        // c. Store raw tx in KVStore
+        multihashKey := multihash.WrapMerkleHash(txid)
+        kvstore.Put(multihashKey.Bytes(), rawTx)
+    }
+
+    // 6. Build index tree for subtree
+    indexRoot := treeBuilder.BuildSubtreeIndex(ctx, msg.Hash, txsWithTerms)
+
+    // 7. Build IPLD merkle tree
+    merkleRoot := merkleBuilder.BuildSubtreeMerkleTree(ctx, txIDs)
+
+    // 8. Store subtree metadata (pending until block arrives)
+    // TODO: Need a "pending subtrees" store?
+```
 
 ---
 
-### Phase 4: Implement IPLD Merkle Tree Builder ⏳
+## Implementation Strategy
 
-**Goal:** Build Bitcoin merkle trees in IPLD format (64-byte nodes)
+### Step 1: Add Helper Function to Check Missing Txs
 
-**Details:** See [IPLD_INTEGRATION_PLAN.md - Phase 4](IPLD_INTEGRATION_PLAN.md#phase-4-implement-ipld-merkle-tree-builder-)
+```go
+// In main.go or new helper package
+func findMissingTxIDs(txIDs []kvstore.Hash, store kvstore.KVStore) []kvstore.Hash {
+    var missing []kvstore.Hash
+    for _, txid := range txIDs {
+        // Wrap txid as multihash
+        key := multihash.WrapMerkleHash(txid)
 
-**Core concept:**
-- Store 64-byte nodes: `left_hash (32 bytes) || right_hash (32 bytes)`
-- Internal hashes are raw Bitcoin hashes (NOT multihash)
-- Storage key is multihash of the node's Bitcoin hash
-- Enables efficient merkle proof by walking IPLD tree
+        // Check if exists in KVStore
+        _, err := store.Get(ctx, key.Bytes())
+        if err != nil {
+            missing = append(missing, txid)
+        }
+    }
+    return missing
+}
+```
 
-**Key methods:**
-- `BuildSubtreeMerkleTree(txids [][32]byte)` - Build and store tree
-- `BuildMerkleProof(treeRoot, position, txCount)` - Walk tree for proof
-- `BuildBlockMerkleProof(subtreeRoots, subtreeIndex)` - Block-level proof
+### Step 2: Wire Up Subtree Message Handler
 
-**Files to create:**
-- `merkle/builder.go`
-- `merkle/builder_test.go`
-- `merkle/proof.go`
-- `merkle/proof_test.go`
+Location: [cmd/indexer/main.go](cmd/indexer/main.go#L161-L172)
+
+Current code just logs:
+```go
+case subtreeData := <-subtreeCh:
+    var subtreeMsg map[string]interface{}
+    if err := json.Unmarshal(subtreeData, &subtreeMsg); err != nil {
+        logger.Error("Failed to parse subtree message", "error", err)
+        continue
+    }
+    logger.Info("SUBTREE", ...)
+```
+
+Replace with actual processing (see flow above).
+
+### Step 3: Handle Transaction Parsing
+
+Need to:
+1. Parse raw transaction bytes using go-sdk
+2. Extract txid by hashing
+3. Pass to indexer for term extraction
+4. Store in cache and KVStore
+
+```go
+import "github.com/bsv-blockchain/go-sdk/transaction"
+
+tx := &transaction.Transaction{}
+tx.ReadFrom(bytes.NewReader(rawTx))
+txid := tx.TxID()  // Calculate hash
+```
+
+### Step 4: Build Index and Merkle Trees
+
+```go
+// Convert cached terms to TreeBuilder format
+txsWithTerms := []treebuilder.TransactionWithTerms{}
+for _, txid := range txIDs {
+    terms := cache.Get(txid)
+    txsWithTerms = append(txsWithTerms, treebuilder.TransactionWithTerms{
+        TxID: txid,
+        Terms: terms,
+    })
+}
+
+// Build index tree
+indexRoot := treeBuilder.BuildSubtreeIndex(ctx, subtreeHash, txsWithTerms)
+
+// Build merkle tree
+merkleRoot := merkleBuilder.BuildSubtreeMerkleTree(ctx, txIDs)
+```
+
+### Step 5: Store Subtree Metadata
+
+**Question:** Where do we store subtree metadata before a block arrives?
+
+Options:
+1. In-memory map keyed by subtree merkle root
+2. Separate "pending_subtrees" table in SQLite
+3. Don't store until block arrives (just cache the trees)
+
+Need to decide on approach.
 
 ---
 
-### Phase 5: Integration ⏳
+## Open Questions
 
-**Goal:** Wire everything together in existing code
+### 1. Pending Subtrees Storage
 
-**Details:** See [IPLD_INTEGRATION_PLAN.md - Phase 5](IPLD_INTEGRATION_PLAN.md#phase-5-integration-)
+**Problem:** Subtrees arrive before blocks. Where do we store `SubtreeInfo` while waiting?
 
-**Updates needed:**
-- `treebuilder/implementation.go` - Use multihash, build IPLD trees
-- `processor/processor.go` - Use new PutBlock(), build merkle trees
-- `cmd/indexer/main.go` - Initialize new components
+**Options:**
+- **A:** In-memory map `map[kvstore.Hash]SubtreeInfo` (lost on restart)
+- **B:** SQLite table `pending_subtrees` (persisted, can resume on restart)
+- **C:** Don't store explicitly - rebuild from KVStore if needed
 
----
+**Recommendation:** Start with Option A (in-memory) for simplicity, add Option B later if needed.
 
-### Phase 6: Testing ⏳
+### 2. Transaction Ordering
 
-**Goal:** Comprehensive testing of all components
+**Problem:** Do txids need to be in a specific order for merkle tree?
 
-**Details:** See [IPLD_INTEGRATION_PLAN.md - Phase 6](IPLD_INTEGRATION_PLAN.md#phase-6-testing-)
+**Answer:** Yes, must match Bitcoin block ordering. Need to preserve order from `FetchSubtreeTxIDs`.
 
-**Test coverage:**
-- Metadata store (blocks, subtrees, reorgs, orphan cleanup)
-- Multihash wrappers (create, verify, unwrap)
-- Merkle builder (build tree, generate proofs, verify)
-- Integration (end-to-end block processing with proofs)
+### 3. Error Handling
 
----
+**Problem:** What if subtree fetch fails? Retry? Skip?
 
-## Implementation Order
+**Strategy:**
+- Log error with subtree hash and peer ID
+- Continue processing other messages
+- Maybe add retry queue later
 
-1. ✅ Phase 1: Metadata store (foundation)
-2. ✅ Phase 2: Multihash wrappers (type safety)
-3. ✅ Phase 3: KVStore update (enable variable keys)
-4. ✅ Phase 4: IPLD merkle builder (core functionality)
-5. ✅ Phase 5: Integration (wire together)
-6. ✅ Phase 6: Testing (validation)
+### 4. Concurrency
 
-**Start with Phase 1.** Each phase builds on the previous.
+**Problem:** Can we process multiple subtrees in parallel?
+
+**Answer:** Not initially - keep it simple. Process sequentially in event loop. Optimize later.
 
 ---
 
-## Key Files to Understand
+## Files to Review
 
-**Current implementation:**
-- `metadata/store.go` - Current interface (will be updated)
-- `metadata/sqlite/sqlite.go` - Current SQLite implementation
-- `kvstore/store.go` - Current KV interface with Hash type
-- `indexnode/indexnode.go` - Index tree node format (stays same)
-
-**Design documents:**
-- `IPLD_INTEGRATION_PLAN.md` - Complete implementation plan
-- `IPLD_RESEARCH_FINDINGS.md` - Research and architectural decisions
-- `PROGRESS.md` - Project history and current status
+Before starting:
+1. [PROGRESS.md](PROGRESS.md) - Full context on completed components
+2. [messages/fetcher.go](messages/fetcher.go) - Three fetcher functions
+3. [cmd/indexer/main.go](cmd/indexer/main.go#L161-L172) - Event loop to modify
+4. [treebuilder/builder.go](treebuilder/builder.go) - TreeBuilder interface
+5. [merkle/builder.go](merkle/builder.go) - MerkleBuilder interface
 
 ---
 
 ## Success Criteria
 
-By end of implementation:
-- ✅ New metadata schema working (blocks + subtrees tables)
-- ✅ Multihash wrappers for type-safe hash handling
-- ✅ KVStore supports variable-length multihash keys
-- ✅ IPLD Bitcoin merkle trees stored and retrievable
-- ✅ Can build merkle proofs by walking IPLD tree
-- ✅ Search workflow works with new schema
-- ✅ Reorg handling works correctly
-- ✅ All tests passing
+After implementing subtree processing:
+
+✅ SubtreeMessages arrive and are unmarshaled correctly
+✅ Txid list fetched successfully
+✅ Missing txs identified and fetched (with smart optimization)
+✅ Transactions parsed and stored in KVStore
+✅ Index terms extracted and cached
+✅ Index tree built and stored
+✅ IPLD merkle tree built and stored
+✅ Subtree metadata tracked (pending block arrival)
+✅ Logging shows processing stats (txs fetched, cache hits, etc.)
 
 ---
 
-## Migration Notes
+## Next Steps After Subtree Processing
 
-**Breaking changes:**
-- `metadata.Store` interface changed (new methods, updated signatures)
-- `kvstore.KVStore` interface changed (Hash → []byte)
-- New dependency: multihash package
-
-**Existing data:** Not compatible, requires fresh start (this is acceptable)
-
-**Backwards compatibility:** Not maintained - this is a major architectural enhancement
+Once subtree processing works:
+1. Implement block message handling
+2. Wire up block → subtree assembly
+3. Add concrete indexers (Address, OP_RETURN)
+4. Build query/lookup system
 
 ---
 
-## Quick Start for Next Session
+## Notes
 
-```bash
-# 1. Read the context files
-cat PROGRESS.md
-cat IPLD_INTEGRATION_PLAN.md
+**Current P2P Status:**
+- Listener is running and receiving real messages from teranode-testnet
+- Messages are JSON format (not protobuf)
+- Need to handle parsing errors gracefully
 
-# 2. Start with Phase 1
-# Update metadata/store.go with new types and interface
-# Implement new SQLite schema in metadata/sqlite/sqlite.go
+**Performance Considerations:**
+- Cache is critical for performance (same tx in multiple subtrees)
+- Smart fetch optimization saves bandwidth
+- Tree building should be fast (BLAKE3 is 10x faster than SHA256)
 
-# 3. Write tests as you go
-# metadata/sqlite/sqlite_test.go
-
-# 4. Proceed through phases in order
-```
-
-**First task:** Update `metadata/store.go` with new `BlockMeta`, `SubtreeMeta`, and `Store` interface methods.
+Good luck! 🚀

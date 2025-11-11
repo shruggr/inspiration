@@ -22,11 +22,12 @@ type SubtreeMessage struct {
 	PeerID string        // Peer that sent this message
 }
 
-// SubtreeData contains parsed transaction IDs from a fetched subtree
+// SubtreeData contains transaction IDs and optionally fetched transaction data
+// Used during subtree processing to track which transactions we have vs need to fetch
 type SubtreeData struct {
-	MerkleRoot kvstore.Hash    // Merkle root of this subtree
-	TxIDs      []kvstore.Hash  // List of transaction IDs (verified by hashing)
-	Txs        [][]byte        // Raw transaction bytes
+	MerkleRoot kvstore.Hash              // Merkle root of this subtree
+	TxIDs      []kvstore.Hash            // Complete list of transaction IDs in subtree
+	TxData     map[kvstore.Hash][]byte   // Raw transaction bytes (only for newly fetched txs)
 }
 
 // BlockHeader contains parsed fields from an 80-byte block header
