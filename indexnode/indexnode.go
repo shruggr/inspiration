@@ -6,186 +6,189 @@ import (
 	"fmt"
 	"sort"
 
-	"lukechampine.com/blake3"
+	"github.com/shruggr/inspiration/multihash"
 )
 
-// IndexNode represents a node in the hierarchical index tree
-// Supports both fixed-width (hash keys) and variable-width (text) modes
-type IndexNode struct {
-	Entries     []*IndexNodeEntry
-	Mode        byte   // indexModeFixed or indexModeVariable
-	FixedKeySize uint16 // Only used for Mode=0 (fixed-width keys)
-}
-
-// IndexNodeEntry represents a single entry in an index node
-type IndexNodeEntry struct {
-	Key       []byte // Original key (variable length)
-	ChildHash []byte // Hash of child node or txid (32 bytes)
-	Data      []byte // Additional data (variable length)
-}
-
-// Binary format supports 4 modes (bitmask):
-//   Bit 0: Key type (0=value/variable, 1=pointer/fixed 32 bytes)
-//   Bit 1: Has data (0=no data, 1=has data section)
+// IndexNode represents a unified index block supporting multiple access patterns
 //
-// MODE 0 (0b00): Value keys, no data
-// MODE 1 (0b01): Pointer keys (fixed 32 bytes), no data
-// MODE 2 (0b10): Value keys, with data
-// MODE 3 (0b11): Pointer keys (fixed 32 bytes), with data
-//
-// POINTER KEY FORMAT (Modes 1 & 3):
+// UNIFIED FORMAT:
 // ┌──────────────────────────────────┐
 // │ Header (8 bytes)                 │
 // │ - version: 1 byte                │
-// │ - mode: 1 byte (bitmask)         │
-// │ - entry_count: 4 bytes (uint32)  │
+// │ - flags: 1 byte                  │
+// │   - bit 0: has_data_section      │
+// │   - bit 1: sort_by_data          │
+// │   - bit 2: is_range              │
+// │   - bits 3-7: reserved           │
+// │ - entry_count: 2 bytes (uint16)  │
 // │ - key_size: 2 bytes (uint16)     │
+// │ - value_size: 1 byte (uint8)     │
+// │ - reserved: 1 byte               │
 // ├──────────────────────────────────┤
 // │ Entry 0                          │
-// │ - key: key_size bytes            │
-// │ - child_hash: 32 bytes           │
-// │ - data_offset: 4 bytes (mode 3)  │ ← Optional data pointer
+// │ - key: key_size bytes (optional) │
+// │ - value: value_size bytes        │
+// │ - offset: 4 bytes (optional)     │
 // ├──────────────────────────────────┤
 // │ Entry 1                          │
 // │ - key: key_size bytes            │
-// │ - child_hash: 32 bytes           │
-// │ - data_offset: 4 bytes (mode 3)  │
+// │ - value: value_size bytes        │
+// │ - offset: 4 bytes (optional)     │
 // ├──────────────────────────────────┤
-// │ Data Section (mode 3 only)       │
-// │ @ data_offset[0]:                │
-// │   - data bytes (variable length) │
-// │ @ data_offset[1]:                │
-// │   - data bytes                   │
+// │ Data Section (if has_data_section)│
+// │ @ offset[0]:                     │
+// │   - variable length data         │
+// │ @ offset[1]:                     │
+// │   - variable length data         │
 // └──────────────────────────────────┘
 //
-// VALUE KEY FORMAT (Modes 0 & 2):
-// ┌──────────────────────────────────┐
-// │ Header (8 bytes)                 │
-// │ - version: 1 byte                │
-// │ - mode: 1 byte (bitmask)         │
-// │ - entry_count: 4 bytes (uint32)  │
-// │ - reserved: 2 bytes              │
-// ├──────────────────────────────────┤
-// │ Offset Table                     │
-// │ - offset[0]: 4 bytes (uint32)    │
-// │ - offset[1]: 4 bytes             │
-// │ - ... (entry_count offsets)      │
-// ├──────────────────────────────────┤
-// │ Data Section                     │
-// │ Entry 0 @ offset[0]:             │
-// │ - key_length: 4 bytes (uint32)   │
-// │ - key_data: N bytes              │
-// │ - child_hash: 32 bytes           │
-// │ - data_length: 4 bytes (mode 2)  │ ← Optional data
-// │ - data: M bytes (mode 2)         │
-// │ Entry 1 @ offset[1]:             │
-// │ - key_length: 4 bytes            │
-// │ - key_data: N bytes              │
-// │ - child_hash: 32 bytes           │
-// │ - data_length: 4 bytes (mode 2)  │
-// │ - data: M bytes (mode 2)         │
-// └──────────────────────────────────┘
+// Access Patterns:
+// 1. key_size > 0, !has_data_section: Binary search by key → value
+// 2. key_size > 0, has_data_section, !sort_by_data: Binary search by key → value + data
+// 3. key_size > 0, has_data_section, sort_by_data: Binary search by data → value
+// 4. key_size = 0, has_data_section: Binary search by data → value
+// 5. key_size = 0, !has_data_section: Array access by index → value
+//
+// Range Mode (is_range = 1):
+// - Entries represent range pointers
+// - key = range_start boundary
+// - value = child IndexNode hash
+// - Sorted by key (or data if sort_by_data)
+type IndexNode struct {
+	Version     uint8
+	HasData     bool
+	SortByData  bool
+	IsRange     bool
+	KeySize     uint16
+	ValueSize   uint8
+	Entries     []*Entry
+	DataSection []byte // Raw data section (managed externally)
+}
+
+// Entry represents a single entry in the index
+type Entry struct {
+	Key    []byte // length = KeySize (empty if KeySize=0)
+	Value  []byte // length = ValueSize (hash/pointer/rowid)
+	Offset uint32 // Offset into DataSection (0 if !HasData)
+}
 
 const (
-	indexNodeVersion   = 1
-	headerSize         = 8
-	offsetSize         = 4
-	childHashSize      = 32
-	keyLengthSize      = 4
-	dataLengthSize     = 4
-	maxKeyLength       = 1024 * 1024 // 1MB max key size
-	maxEntriesPerNode  = 100000      // Reasonable limit
+	version    = 1
+	headerSize = 8
+	offsetSize = 4
+
+	// Flag bits
+	flagHasData    = 0x01 // bit 0
+	flagSortByData = 0x02 // bit 1
+	flagIsRange    = 0x04 // bit 2
+
+	// Limits
+	maxKeySize    = 65535 // uint16 max
+	maxValueSize  = 255   // uint8 max
+	maxEntryCount = 65535 // uint16 max
 )
 
-// Mode bitmask values
-const (
-	indexModeValueKey    = 0x00 // 0b00: Variable-length keys, no data
-	indexModePointerKey  = 0x01 // 0b01: Fixed 32-byte hash keys, no data
-	indexModeValueData   = 0x02 // 0b10: Variable-length keys, with data
-	indexModePointerData = 0x03 // 0b11: Fixed 32-byte hash keys, with data
-)
+// Config for building index nodes with range splitting
+type Config struct {
+	MaxNodeSize     int // Default 1MB
+	TargetChildSize int // Default 512KB for range splitting
+}
 
-// Mode bit flags
-const (
-	indexKeyTypePointer = 0x01 // Bit 0: 1 = pointer (fixed 32 bytes), 0 = value (variable)
-	indexHasData        = 0x02 // Bit 1: 1 = has data section, 0 = no data
-)
-
-// NewIndexNode creates a new variable-width index node (no data)
-func NewIndexNode() *IndexNode {
-	return &IndexNode{
-		Entries: make([]*IndexNodeEntry, 0),
-		Mode:    indexModeValueKey,
+// DefaultConfig returns sensible defaults
+func DefaultConfig() Config {
+	return Config{
+		MaxNodeSize:     1024 * 1024,       // 1MB
+		TargetChildSize: 512 * 1024,        // 512KB
 	}
 }
 
-// NewFixedKeyIndexNode creates a new fixed-width index node (pointer keys, no data)
-func NewFixedKeyIndexNode(keySize uint16) *IndexNode {
+// NewIndexNode creates a new index node
+func NewIndexNode(keySize uint16, valueSize uint8, hasData, sortByData, isRange bool) *IndexNode {
 	return &IndexNode{
-		Entries:      make([]*IndexNodeEntry, 0),
-		Mode:         indexModePointerKey,
-		FixedKeySize: keySize,
+		Version:    version,
+		HasData:    hasData,
+		SortByData: sortByData,
+		IsRange:    isRange,
+		KeySize:    keySize,
+		ValueSize:  valueSize,
+		Entries:    make([]*Entry, 0),
 	}
 }
 
-// NewIndexNodeWithData creates a variable-width index node with data support
-func NewIndexNodeWithData() *IndexNode {
-	return &IndexNode{
-		Entries: make([]*IndexNodeEntry, 0),
-		Mode:    indexModeValueData,
+// AddEntry adds an entry to the node
+func (n *IndexNode) AddEntry(key, value []byte, dataOffset uint32) error {
+	// Validate key size
+	if n.KeySize > 0 && len(key) != int(n.KeySize) {
+		return fmt.Errorf("key size mismatch: expected %d, got %d", n.KeySize, len(key))
 	}
-}
-
-// NewFixedKeyIndexNodeWithData creates a fixed-width index node with data support
-func NewFixedKeyIndexNodeWithData(keySize uint16) *IndexNode {
-	return &IndexNode{
-		Entries:      make([]*IndexNodeEntry, 0),
-		Mode:         indexModePointerData,
-		FixedKeySize: keySize,
-	}
-}
-
-// AddEntry adds an entry to the node (entries should be added in sorted order)
-func (n *IndexNode) AddEntry(key []byte, childHash []byte, data []byte) error {
-	if len(childHash) != childHashSize {
-		return fmt.Errorf("child hash must be 32 bytes, got %d", len(childHash))
-	}
-	if len(key) == 0 {
-		return fmt.Errorf("key cannot be empty")
+	if n.KeySize == 0 && len(key) != 0 {
+		return fmt.Errorf("key should be empty when KeySize=0")
 	}
 
-	// Validate key size based on mode
-	isPointerKey := (n.Mode & indexKeyTypePointer) != 0
-	if isPointerKey {
-		if uint16(len(key)) != n.FixedKeySize {
-			return fmt.Errorf("key size must be %d bytes in pointer mode, got %d", n.FixedKeySize, len(key))
-		}
-	} else {
-		if len(key) > maxKeyLength {
-			return fmt.Errorf("key too large: %d bytes (max %d)", len(key), maxKeyLength)
-		}
+	// Validate value size
+	if len(value) != int(n.ValueSize) {
+		return fmt.Errorf("value size mismatch: expected %d, got %d", n.ValueSize, len(value))
 	}
 
-	// Validate data if mode doesn't support it
-	hasData := (n.Mode & indexHasData) != 0
-	if !hasData && len(data) > 0 {
-		return fmt.Errorf("mode %d does not support data", n.Mode)
+	// Validate offset
+	if !n.HasData && dataOffset != 0 {
+		return fmt.Errorf("offset should be 0 when HasData=false")
 	}
 
-	n.Entries = append(n.Entries, &IndexNodeEntry{
-		Key:       key,
-		ChildHash: childHash,
-		Data:      data,
+	n.Entries = append(n.Entries, &Entry{
+		Key:    key,
+		Value:  value,
+		Offset: dataOffset,
 	})
 
 	return nil
 }
 
-// Sort sorts entries by key (lexicographic)
-func (n *IndexNode) Sort() {
-	sort.Slice(n.Entries, func(i, j int) bool {
-		return bytes.Compare(n.Entries[i].Key, n.Entries[j].Key) < 0
-	})
+// SetDataSection sets the raw data section bytes
+func (n *IndexNode) SetDataSection(data []byte) {
+	n.DataSection = data
+}
+
+// Sort sorts entries by key or data section (based on SortByData flag)
+func (n *IndexNode) Sort() error {
+	if n.SortByData {
+		// Sort by data section values
+		if !n.HasData {
+			return fmt.Errorf("cannot sort by data when HasData=false")
+		}
+		sort.Slice(n.Entries, func(i, j int) bool {
+			dataI := n.getDataAt(n.Entries[i].Offset)
+			dataJ := n.getDataAt(n.Entries[j].Offset)
+			return bytes.Compare(dataI, dataJ) < 0
+		})
+	} else {
+		// Sort by key
+		if n.KeySize == 0 {
+			return fmt.Errorf("cannot sort by key when KeySize=0")
+		}
+		sort.Slice(n.Entries, func(i, j int) bool {
+			return bytes.Compare(n.Entries[i].Key, n.Entries[j].Key) < 0
+		})
+	}
+	return nil
+}
+
+// getDataAt reads variable-length data from data section at offset
+// Uses a simple length-prefix format: [length: 4 bytes][data: N bytes]
+func (n *IndexNode) getDataAt(offset uint32) []byte {
+	if offset == 0 || int(offset) >= len(n.DataSection) {
+		return nil
+	}
+	if int(offset)+4 > len(n.DataSection) {
+		return nil
+	}
+	length := binary.BigEndian.Uint32(n.DataSection[offset : offset+4])
+	dataStart := offset + 4
+	dataEnd := dataStart + length
+	if int(dataEnd) > len(n.DataSection) {
+		return nil
+	}
+	return n.DataSection[dataStart:dataEnd]
 }
 
 // Marshal serializes the index node to binary format
@@ -193,351 +196,258 @@ func (n *IndexNode) Marshal() ([]byte, error) {
 	if len(n.Entries) == 0 {
 		return nil, fmt.Errorf("cannot marshal empty index node")
 	}
-	if len(n.Entries) > maxEntriesPerNode {
-		return nil, fmt.Errorf("too many entries: %d (max %d)", len(n.Entries), maxEntriesPerNode)
+	if len(n.Entries) > maxEntryCount {
+		return nil, fmt.Errorf("too many entries: %d (max %d)", len(n.Entries), maxEntryCount)
 	}
 
-	isPointerKey := (n.Mode & indexKeyTypePointer) != 0
-	if isPointerKey {
-		return n.marshalPointerKey()
-	}
-	return n.marshalValueKey()
-}
-
-// marshalPointerKey serializes a pointer-key (fixed-width) node
-func (n *IndexNode) marshalPointerKey() ([]byte, error) {
-	hasData := (n.Mode & indexHasData) != 0
-
-	// Calculate sizes
-	entrySize := int(n.FixedKeySize) + childHashSize
-	if hasData {
-		entrySize += offsetSize // Add 4 bytes for data offset
+	// Calculate entry size
+	entrySize := int(n.KeySize) + int(n.ValueSize)
+	if n.HasData {
+		entrySize += offsetSize
 	}
 
-	// Calculate data section size
-	dataSize := 0
-	if hasData {
-		for _, entry := range n.Entries {
-			dataSize += len(entry.Data)
-		}
+	// Calculate total size
+	totalSize := headerSize + (len(n.Entries) * entrySize)
+	if n.HasData {
+		totalSize += len(n.DataSection)
 	}
 
-	totalSize := headerSize + (len(n.Entries) * entrySize) + dataSize
 	buf := make([]byte, totalSize)
 
 	// Write header
-	buf[0] = indexNodeVersion
-	buf[1] = n.Mode
-	binary.BigEndian.PutUint32(buf[2:6], uint32(len(n.Entries)))
-	binary.BigEndian.PutUint16(buf[6:8], n.FixedKeySize)
+	buf[0] = n.Version
+
+	// Build flags byte
+	var flags uint8
+	if n.HasData {
+		flags |= flagHasData
+	}
+	if n.SortByData {
+		flags |= flagSortByData
+	}
+	if n.IsRange {
+		flags |= flagIsRange
+	}
+	buf[1] = flags
+
+	binary.BigEndian.PutUint16(buf[2:4], uint16(len(n.Entries)))
+	binary.BigEndian.PutUint16(buf[4:6], n.KeySize)
+	buf[6] = n.ValueSize
+	buf[7] = 0 // reserved
 
 	// Write entries
 	offset := headerSize
-	dataOffset := headerSize + (len(n.Entries) * entrySize)
-
 	for _, entry := range n.Entries {
-		// Write key
-		copy(buf[offset:offset+int(n.FixedKeySize)], entry.Key)
-		offset += int(n.FixedKeySize)
+		// Write key (if KeySize > 0)
+		if n.KeySize > 0 {
+			copy(buf[offset:offset+int(n.KeySize)], entry.Key)
+			offset += int(n.KeySize)
+		}
 
-		// Write child hash
-		copy(buf[offset:offset+childHashSize], entry.ChildHash)
-		offset += childHashSize
+		// Write value
+		copy(buf[offset:offset+int(n.ValueSize)], entry.Value)
+		offset += int(n.ValueSize)
 
-		// Write data offset (if mode has data)
-		if hasData {
-			if len(entry.Data) > 0 {
-				binary.BigEndian.PutUint32(buf[offset:offset+offsetSize], uint32(dataOffset))
-				// Copy data to data section
-				copy(buf[dataOffset:dataOffset+len(entry.Data)], entry.Data)
-				dataOffset += len(entry.Data)
-			} else {
-				binary.BigEndian.PutUint32(buf[offset:offset+offsetSize], 0) // 0 = no data
-			}
+		// Write offset (if HasData)
+		if n.HasData {
+			binary.BigEndian.PutUint32(buf[offset:offset+offsetSize], entry.Offset)
 			offset += offsetSize
 		}
 	}
 
-	return buf, nil
-}
-
-// marshalValueKey serializes a value-key (variable-width) node
-func (n *IndexNode) marshalValueKey() ([]byte, error) {
-	hasData := (n.Mode & indexHasData) != 0
-
-	// Calculate total size
-	offsetTableSize := len(n.Entries) * offsetSize
-	dataSize := 0
-	for _, entry := range n.Entries {
-		dataSize += keyLengthSize + len(entry.Key) + childHashSize
-		if hasData {
-			dataSize += dataLengthSize + len(entry.Data)
-		}
-	}
-
-	totalSize := headerSize + offsetTableSize + dataSize
-	buf := make([]byte, totalSize)
-
-	// Write header
-	buf[0] = indexNodeVersion
-	buf[1] = n.Mode
-	binary.BigEndian.PutUint32(buf[2:6], uint32(len(n.Entries)))
-	// Reserved bytes 6-7 are zero
-
-	// Calculate and write offset table
-	currentOffset := uint32(headerSize + offsetTableSize)
-	offsetTableStart := headerSize
-
-	for i, entry := range n.Entries {
-		offsetPos := offsetTableStart + (i * offsetSize)
-		binary.BigEndian.PutUint32(buf[offsetPos:offsetPos+offsetSize], currentOffset)
-
-		// Calculate next offset
-		entrySize := keyLengthSize + len(entry.Key) + childHashSize
-		if hasData {
-			entrySize += dataLengthSize + len(entry.Data)
-		}
-		currentOffset += uint32(entrySize)
-	}
-
-	// Write data section
-	dataOffset := headerSize + offsetTableSize
-	for _, entry := range n.Entries {
-		// Write key length
-		binary.BigEndian.PutUint32(buf[dataOffset:dataOffset+keyLengthSize], uint32(len(entry.Key)))
-		dataOffset += keyLengthSize
-
-		// Write key data
-		copy(buf[dataOffset:dataOffset+len(entry.Key)], entry.Key)
-		dataOffset += len(entry.Key)
-
-		// Write child hash
-		copy(buf[dataOffset:dataOffset+childHashSize], entry.ChildHash)
-		dataOffset += childHashSize
-
-		// Write data (if mode has data)
-		if hasData {
-			binary.BigEndian.PutUint32(buf[dataOffset:dataOffset+dataLengthSize], uint32(len(entry.Data)))
-			dataOffset += dataLengthSize
-			copy(buf[dataOffset:dataOffset+len(entry.Data)], entry.Data)
-			dataOffset += len(entry.Data)
-		}
+	// Write data section (if HasData)
+	if n.HasData && len(n.DataSection) > 0 {
+		copy(buf[offset:], n.DataSection)
 	}
 
 	return buf, nil
 }
 
 // Unmarshal deserializes an index node from binary format
-func UnmarshalIndexNode(data []byte) (*IndexNode, error) {
+func Unmarshal(data []byte) (*IndexNode, error) {
 	if len(data) < headerSize {
 		return nil, fmt.Errorf("data too short for header: %d bytes", len(data))
 	}
 
 	// Read header
-	version := data[0]
-	if version != indexNodeVersion {
-		return nil, fmt.Errorf("unsupported version: %d", version)
+	ver := data[0]
+	if ver != version {
+		return nil, fmt.Errorf("unsupported version: %d", ver)
 	}
 
-	mode := data[1]
-	entryCount := binary.BigEndian.Uint32(data[2:6])
+	flags := data[1]
+	hasData := (flags & flagHasData) != 0
+	sortByData := (flags & flagSortByData) != 0
+	isRange := (flags & flagIsRange) != 0
+
+	entryCount := binary.BigEndian.Uint16(data[2:4])
+	keySize := binary.BigEndian.Uint16(data[4:6])
+	valueSize := data[6]
 
 	if entryCount == 0 {
 		return nil, fmt.Errorf("entry count is zero")
 	}
-	if entryCount > maxEntriesPerNode {
-		return nil, fmt.Errorf("too many entries: %d", entryCount)
-	}
 
-	isPointerKey := (mode & indexKeyTypePointer) != 0
-	if isPointerKey {
-		return unmarshalPointerKey(data, mode, entryCount)
-	}
-	return unmarshalValueKey(data, mode, entryCount)
-}
-
-// unmarshalPointerKey deserializes a pointer-key (fixed-width) node
-func unmarshalPointerKey(data []byte, mode byte, entryCount uint32) (*IndexNode, error) {
-	hasData := (mode & indexHasData) != 0
-	keySize := binary.BigEndian.Uint16(data[6:8])
-
-	entrySize := int(keySize) + childHashSize
+	// Calculate entry size
+	entrySize := int(keySize) + int(valueSize)
 	if hasData {
-		entrySize += offsetSize // Add 4 bytes for data offset
+		entrySize += offsetSize
 	}
 
-	entriesSize := int(entryCount) * entrySize
-	minExpectedSize := headerSize + entriesSize
-
-	if len(data) < minExpectedSize {
-		return nil, fmt.Errorf("data too short: got %d, need at least %d", len(data), minExpectedSize)
+	// Validate data size
+	minSize := headerSize + (int(entryCount) * entrySize)
+	if len(data) < minSize {
+		return nil, fmt.Errorf("data too short: got %d, need at least %d", len(data), minSize)
 	}
 
 	node := &IndexNode{
-		Entries:      make([]*IndexNodeEntry, entryCount),
-		Mode:         mode,
-		FixedKeySize: keySize,
+		Version:    ver,
+		HasData:    hasData,
+		SortByData: sortByData,
+		IsRange:    isRange,
+		KeySize:    keySize,
+		ValueSize:  valueSize,
+		Entries:    make([]*Entry, entryCount),
 	}
 
+	// Read entries
 	offset := headerSize
-	for i := uint32(0); i < entryCount; i++ {
-		key := make([]byte, keySize)
-		copy(key, data[offset:offset+int(keySize)])
-		offset += int(keySize)
+	for i := uint16(0); i < entryCount; i++ {
+		entry := &Entry{}
 
-		childHash := make([]byte, childHashSize)
-		copy(childHash, data[offset:offset+childHashSize])
-		offset += childHashSize
+		// Read key (if KeySize > 0)
+		if keySize > 0 {
+			entry.Key = make([]byte, keySize)
+			copy(entry.Key, data[offset:offset+int(keySize)])
+			offset += int(keySize)
+		}
 
-		var entryData []byte
+		// Read value
+		entry.Value = make([]byte, valueSize)
+		copy(entry.Value, data[offset:offset+int(valueSize)])
+		offset += int(valueSize)
+
+		// Read offset (if HasData)
 		if hasData {
-			dataOffset := binary.BigEndian.Uint32(data[offset : offset+offsetSize])
+			entry.Offset = binary.BigEndian.Uint32(data[offset : offset+offsetSize])
 			offset += offsetSize
-
-			if dataOffset > 0 {
-				// Find the length by looking at next entry's offset or end of data
-				dataEnd := len(data)
-				if i < entryCount-1 {
-					// Look ahead to next entry's data offset
-					nextEntryOffset := headerSize + int(i+1)*entrySize + int(keySize) + childHashSize
-					nextDataOffset := binary.BigEndian.Uint32(data[nextEntryOffset : nextEntryOffset+offsetSize])
-					if nextDataOffset > 0 {
-						dataEnd = int(nextDataOffset)
-					}
-				}
-
-				dataLen := dataEnd - int(dataOffset)
-				if dataLen > 0 && int(dataOffset)+dataLen <= len(data) {
-					entryData = make([]byte, dataLen)
-					copy(entryData, data[dataOffset:dataOffset+uint32(dataLen)])
-				}
-			}
 		}
 
-		node.Entries[i] = &IndexNodeEntry{
-			Key:       key,
-			ChildHash: childHash,
-			Data:      entryData,
-		}
+		node.Entries[i] = entry
+	}
+
+	// Read data section (if HasData)
+	if hasData && len(data) > offset {
+		node.DataSection = make([]byte, len(data)-offset)
+		copy(node.DataSection, data[offset:])
 	}
 
 	return node, nil
 }
 
-// unmarshalValueKey deserializes a value-key (variable-width) node
-func unmarshalValueKey(data []byte, mode byte, entryCount uint32) (*IndexNode, error) {
-	hasData := (mode & indexHasData) != 0
-	// Read offset table
-	offsetTableStart := headerSize
-	offsetTableEnd := offsetTableStart + int(entryCount)*offsetSize
-	if len(data) < offsetTableEnd {
-		return nil, fmt.Errorf("data too short for offset table")
-	}
-
-	node := &IndexNode{
-		Entries: make([]*IndexNodeEntry, entryCount),
-		Mode:    mode,
-	}
-
-	// Read each entry
-	for i := uint32(0); i < entryCount; i++ {
-		offsetPos := offsetTableStart + int(i)*offsetSize
-		entryOffset := binary.BigEndian.Uint32(data[offsetPos : offsetPos+offsetSize])
-
-		if int(entryOffset) >= len(data) {
-			return nil, fmt.Errorf("invalid offset for entry %d: %d", i, entryOffset)
-		}
-
-		// Read key length
-		if int(entryOffset)+keyLengthSize > len(data) {
-			return nil, fmt.Errorf("data too short for key length at entry %d", i)
-		}
-		keyLen := binary.BigEndian.Uint32(data[entryOffset : entryOffset+keyLengthSize])
-		if keyLen > maxKeyLength {
-			return nil, fmt.Errorf("key too large at entry %d: %d bytes", i, keyLen)
-		}
-
-		keyStart := entryOffset + keyLengthSize
-		keyEnd := keyStart + keyLen
-
-		if int(keyEnd) > len(data) {
-			return nil, fmt.Errorf("data too short for key at entry %d", i)
-		}
-
-		// Read child hash
-		hashStart := keyEnd
-		hashEnd := hashStart + childHashSize
-
-		if int(hashEnd) > len(data) {
-			return nil, fmt.Errorf("data too short for child hash at entry %d", i)
-		}
-
-		key := make([]byte, keyLen)
-		copy(key, data[keyStart:keyEnd])
-
-		childHash := make([]byte, childHashSize)
-		copy(childHash, data[hashStart:hashEnd])
-
-		// Read data (if mode has data)
-		var entryData []byte
-		if hasData {
-			dataLenStart := hashEnd
-			dataLenEnd := dataLenStart + dataLengthSize
-
-			if int(dataLenEnd) > len(data) {
-				return nil, fmt.Errorf("data too short for data length at entry %d", i)
-			}
-
-			dataLen := binary.BigEndian.Uint32(data[dataLenStart:dataLenEnd])
-			if dataLen > 0 {
-				dataStart := dataLenEnd
-				dataEnd := dataStart + dataLen
-
-				if int(dataEnd) > len(data) {
-					return nil, fmt.Errorf("data too short for data at entry %d", i)
-				}
-
-				entryData = make([]byte, dataLen)
-				copy(entryData, data[dataStart:dataEnd])
-			}
-		}
-
-		node.Entries[i] = &IndexNodeEntry{
-			Key:       key,
-			ChildHash: childHash,
-			Data:      entryData,
-		}
-	}
-
-	return node, nil
-}
-
-// Hash computes the BLAKE3 hash of the serialized node
-func (n *IndexNode) Hash() ([]byte, error) {
+// Hash computes the BLAKE3 multihash of the serialized node
+func (n *IndexNode) Hash() (multihash.IndexHash, error) {
 	data, err := n.Marshal()
 	if err != nil {
 		return nil, err
 	}
-
-	hash := blake3.Sum256(data)
-	return hash[:], nil
+	return multihash.NewIndexHash(data)
 }
 
 // Find performs binary search to find an entry by key
-func (n *IndexNode) Find(key []byte) ([]byte, bool) {
+// Returns the value and whether it was found
+func (n *IndexNode) Find(searchKey []byte) ([]byte, bool) {
+	if n.KeySize == 0 {
+		return nil, false
+	}
+	if n.SortByData {
+		return nil, false
+	}
+
 	idx := sort.Search(len(n.Entries), func(i int) bool {
-		return bytes.Compare(n.Entries[i].Key, key) >= 0
+		return bytes.Compare(n.Entries[i].Key, searchKey) >= 0
 	})
 
-	if idx < len(n.Entries) && bytes.Equal(n.Entries[idx].Key, key) {
-		return n.Entries[idx].ChildHash, true
+	if idx < len(n.Entries) && bytes.Equal(n.Entries[idx].Key, searchKey) {
+		return n.Entries[idx].Value, true
 	}
 
 	return nil, false
 }
 
-// HashKey computes the BLAKE3 hash of a key
-func HashKey(key []byte) []byte {
-	hash := blake3.Sum256(key)
-	return hash[:]
+// FindByData performs binary search by data section value
+// Returns the value (hash/pointer) and whether it was found
+func (n *IndexNode) FindByData(searchData []byte) ([]byte, bool) {
+	if !n.HasData {
+		return nil, false
+	}
+	if !n.SortByData {
+		return nil, false
+	}
+
+	idx := sort.Search(len(n.Entries), func(i int) bool {
+		data := n.getDataAt(n.Entries[i].Offset)
+		return bytes.Compare(data, searchData) >= 0
+	})
+
+	if idx < len(n.Entries) {
+		data := n.getDataAt(n.Entries[idx].Offset)
+		if bytes.Equal(data, searchData) {
+			return n.Entries[idx].Value, true
+		}
+	}
+
+	return nil, false
+}
+
+// FindRange finds which range contains the given key (for range nodes)
+// Returns the child hash to follow
+func (n *IndexNode) FindRange(searchKey []byte) ([]byte, bool) {
+	if !n.IsRange {
+		return nil, false
+	}
+
+	// Binary search to find the range
+	// Ranges are: entry[i].Key <= searchKey < entry[i+1].Key
+	idx := sort.Search(len(n.Entries), func(i int) bool {
+		var cmpKey []byte
+		if n.SortByData {
+			cmpKey = n.getDataAt(n.Entries[i].Offset)
+		} else {
+			cmpKey = n.Entries[i].Key
+		}
+		return bytes.Compare(cmpKey, searchKey) > 0
+	})
+
+	// Move back one to get the range that contains searchKey
+	if idx > 0 {
+		idx--
+	}
+
+	if idx < len(n.Entries) {
+		return n.Entries[idx].Value, true
+	}
+
+	return nil, false
+}
+
+// GetByIndex returns the value at the given index (for array-style access)
+func (n *IndexNode) GetByIndex(index int) ([]byte, bool) {
+	if index < 0 || index >= len(n.Entries) {
+		return nil, false
+	}
+	return n.Entries[index].Value, true
+}
+
+// Size returns the serialized size of the node
+func (n *IndexNode) Size() int {
+	entrySize := int(n.KeySize) + int(n.ValueSize)
+	if n.HasData {
+		entrySize += offsetSize
+	}
+	totalSize := headerSize + (len(n.Entries) * entrySize)
+	if n.HasData {
+		totalSize += len(n.DataSection)
+	}
+	return totalSize
 }

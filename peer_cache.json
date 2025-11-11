@@ -1,0 +1,59 @@
+[
+  {
+    "id": "12D3KooWKtefF7XtYGZw6en8MAvFZ8hMqoC5PbszSgCTfBnDakxf",
+    "name": "Daniel Test",
+    "addrs": [
+      "/ip4/51.89.230.134/tcp/9905"
+    ],
+    "last_seen": "2025-11-10T21:44:04.825327-05:00"
+  },
+  {
+    "id": "12D3KooWKugBctywNoSpt3JvsajQV4bYncd9g7RknbPtRMntG5R3",
+    "name": "TeraNode.Api.sv",
+    "addrs": [
+      "/ip4/198.154.93.200/tcp/44287",
+      "/ip4/139.178.91.71/udp/4001/quic-v1/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN/p2p-circuit"
+    ],
+    "last_seen": "2025-11-10T21:44:04.825327-05:00"
+  },
+  {
+    "id": "12D3KooWFj5nh1m3iAooxnfp5VvDtufYajTpBSopUt7anj4XLqJp",
+    "name": "teranode-ttn-us-1",
+    "addrs": [
+      "/ip4/18.211.244.173/tcp/9905"
+    ],
+    "last_seen": "2025-11-10T21:44:04.825327-05:00"
+  },
+  {
+    "id": "12D3KooWSWtZFg6LuXudZ8bQhSCi74XpehHYWvXnEECBeBu8bnkV",
+    "name": "node2.gorillanode.io",
+    "addrs": [
+      "/ip4/15.204.196.227/tcp/42491"
+    ],
+    "last_seen": "2025-11-10T21:44:04.825327-05:00"
+  },
+  {
+    "id": "12D3KooWACGLb3mGRSPK64W5WUZy8Y1gnfbY7CiKhpnN6r9QdcjX",
+    "name": "node1.gorillanode.io",
+    "addrs": [
+      "/ip4/15.204.196.160/tcp/36163"
+    ],
+    "last_seen": "2025-11-10T21:44:04.825327-05:00"
+  },
+  {
+    "id": "12D3KooWGTmSZJxyfc6g1LqTkWqn5LiWtyntpabhfEmiTMQzox48",
+    "name": "Deggen",
+    "addrs": [
+      "/ip4/158.69.216.174/tcp/41513"
+    ],
+    "last_seen": "2025-11-10T21:44:04.825327-05:00"
+  },
+  {
+    "id": "12D3KooWSEs4SCfDu7sutQFQTAEbPD1FXgGXMJBQaKDAPCWrgc1h",
+    "name": "Satoshi.io",
+    "addrs": [
+      "/ip4/198.154.93.210/tcp/32973"
+    ],
+    "last_seen": "2025-11-10T21:44:04.825327-05:00"
+  }
+]

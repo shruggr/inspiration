@@ -3,9 +3,9 @@ package badger
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/dgraph-io/badger/v4"
-	"github.com/shruggr/inspiration/kvstore"
 )
 
 // Store is a BadgerDB-backed implementation of kvstore.KVStore
@@ -36,30 +36,40 @@ func New(config *Config) (*Store, error) {
 }
 
 // Put stores a key-value pair
-func (s *Store) Put(ctx context.Context, key kvstore.Hash, value []byte) error {
+func (s *Store) Put(ctx context.Context, key []byte, value []byte) error {
 	return s.db.Update(func(txn *badger.Txn) error {
-		return txn.Set(key[:], value)
+		return txn.Set(key, value)
+	})
+}
+
+// PutWithTTL stores a key-value pair with a time-to-live
+// The entry will be automatically deleted after the TTL expires
+// Useful for temporary data like intermediate index entries or caching
+func (s *Store) PutWithTTL(ctx context.Context, key []byte, value []byte, ttl time.Duration) error {
+	return s.db.Update(func(txn *badger.Txn) error {
+		e := badger.NewEntry(key, value).WithTTL(ttl)
+		return txn.SetEntry(e)
 	})
 }
 
 // Get retrieves a value by key
-func (s *Store) Get(ctx context.Context, key kvstore.Hash) ([]byte, error) {
+func (s *Store) Get(ctx context.Context, key []byte) ([]byte, error) {
 	var value []byte
 
 	err := s.db.View(func(txn *badger.Txn) error {
-		item, err := txn.Get(key[:])
+		item, err := txn.Get(key)
 		if err != nil {
 			return err
 		}
 
 		return item.Value(func(val []byte) error {
-			value = append([]byte{}, val...) // Copy value
+			value = append([]byte{}, val...)
 			return nil
 		})
 	})
 
 	if err == badger.ErrKeyNotFound {
-		return nil, nil // Return nil for non-existent keys
+		return nil, nil
 	}
 	if err != nil {
 		return nil, err
@@ -69,9 +79,9 @@ func (s *Store) Get(ctx context.Context, key kvstore.Hash) ([]byte, error) {
 }
 
 // Delete removes a key-value pair
-func (s *Store) Delete(ctx context.Context, key kvstore.Hash) error {
+func (s *Store) Delete(ctx context.Context, key []byte) error {
 	return s.db.Update(func(txn *badger.Txn) error {
-		return txn.Delete(key[:])
+		return txn.Delete(key)
 	})
 }
 

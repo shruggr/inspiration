@@ -50,7 +50,7 @@ func TestBuildSubtreeIndex(t *testing.T) {
 	}
 
 	// Verify root node was stored
-	rootNodeBytes, err := store.Get(ctx, rootHash)
+	rootNodeBytes, err := store.Get(ctx, rootHash[:])
 	if err != nil {
 		t.Fatalf("Failed to retrieve root node: %v", err)
 	}

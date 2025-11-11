@@ -87,7 +87,7 @@ func (b *implementation) BuildSubtreeIndex(
 		}
 
 		leafNodeHash := hashNode(leafNodeBytes)
-		if err := b.store.Put(ctx, leafNodeHash, leafNodeBytes); err != nil {
+		if err := b.store.Put(ctx, leafNodeHash[:], leafNodeBytes); err != nil {
 			return kvstore.Hash{}, fmt.Errorf("failed to store leaf node: %w", err)
 		}
 
@@ -118,7 +118,7 @@ func (b *implementation) BuildSubtreeIndex(
 	}
 
 	rootHash := hashNode(rootNodeBytes)
-	if err := b.store.Put(ctx, rootHash, rootNodeBytes); err != nil {
+	if err := b.store.Put(ctx, rootHash[:], rootNodeBytes); err != nil {
 		return kvstore.Hash{}, fmt.Errorf("failed to store root node: %w", err)
 	}
 
@@ -185,7 +185,7 @@ func (b *implementation) storeTxIDList(ctx context.Context, txids []kvstore.Hash
 
 	// Hash and store
 	hash := hashNode(buf)
-	if err := b.store.Put(ctx, hash, buf); err != nil {
+	if err := b.store.Put(ctx, hash[:], buf); err != nil {
 		return kvstore.Hash{}, err
 	}
 

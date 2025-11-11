@@ -46,28 +46,70 @@ func New(config *Config) (*Store, error) {
 func (s *Store) initSchema() error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS blocks (
-		height INTEGER PRIMARY KEY,
-		block_hash BLOB NOT NULL,
-		merkle_root BLOB NOT NULL,
-		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		height       INTEGER NOT NULL,
+		block_hash   BLOB NOT NULL,
+		merkle_root  BLOB PRIMARY KEY,
+		tx_count     INTEGER NOT NULL,
+		status       TEXT NOT NULL DEFAULT 'main',
+		timestamp    INTEGER,
+		created_at   INTEGER DEFAULT (strftime('%s', 'now'))
 	);
 
-	CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(block_hash);
+	CREATE INDEX IF NOT EXISTS idx_blocks_status_height ON blocks(status, height);
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(block_hash);
+
+	CREATE TABLE IF NOT EXISTS subtrees (
+		merkle_root         BLOB NOT NULL,
+		subtree_index       INTEGER NOT NULL,
+		subtree_merkle_root BLOB NOT NULL,
+		tx_count            INTEGER NOT NULL,
+		index_root          BLOB NOT NULL,
+		tx_tree_root        BLOB NOT NULL,
+
+		PRIMARY KEY (merkle_root, subtree_index),
+		FOREIGN KEY (merkle_root) REFERENCES blocks(merkle_root) ON DELETE CASCADE
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_subtrees_merkle_root_subtree_index ON subtrees(merkle_root, subtree_index);
 	`
 
 	_, err := s.db.Exec(schema)
 	return err
 }
 
-// PutBlock stores block metadata
-func (s *Store) PutBlock(ctx context.Context, meta *metadata.BlockMeta) error {
-	_, err := s.db.ExecContext(ctx,
-		`INSERT OR REPLACE INTO blocks (height, block_hash, merkle_root) VALUES (?, ?, ?)`,
-		meta.Height, meta.BlockHash[:], meta.MerkleRoot[:],
+// PutBlock stores block metadata with associated subtrees atomically
+func (s *Store) PutBlock(ctx context.Context, block *metadata.BlockMeta, subtrees []*metadata.SubtreeMeta) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(ctx,
+		`INSERT OR REPLACE INTO blocks (height, block_hash, merkle_root, tx_count, status, timestamp)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		block.Height, block.BlockHash[:], block.MerkleRoot[:], block.TxCount, string(block.Status), block.Timestamp,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to insert block: %w", err)
 	}
+
+	for _, subtree := range subtrees {
+		_, err = tx.ExecContext(ctx,
+			`INSERT INTO subtrees (merkle_root, subtree_index, subtree_merkle_root, tx_count, index_root, tx_tree_root)
+			 VALUES (?, ?, ?, ?, ?, ?)`,
+			subtree.MerkleRoot[:], subtree.SubtreeIndex, subtree.SubtreeMerkleRoot[:],
+			subtree.TxCount, subtree.IndexRoot, subtree.TxTreeRoot,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to insert subtree %d: %w", subtree.SubtreeIndex, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
 	return nil
 }
 
@@ -75,14 +117,17 @@ func (s *Store) PutBlock(ctx context.Context, meta *metadata.BlockMeta) error {
 func (s *Store) GetBlock(ctx context.Context, height uint64) (*metadata.BlockMeta, error) {
 	var meta metadata.BlockMeta
 	var blockHash, merkleRoot []byte
+	var status string
+	var timestamp sql.NullInt64
 
 	err := s.db.QueryRowContext(ctx,
-		`SELECT height, block_hash, merkle_root FROM blocks WHERE height = ?`,
+		`SELECT height, block_hash, merkle_root, tx_count, status, timestamp
+		 FROM blocks WHERE height = ? AND status = 'main'`,
 		height,
-	).Scan(&meta.Height, &blockHash, &merkleRoot)
+	).Scan(&meta.Height, &blockHash, &merkleRoot, &meta.TxCount, &status, &timestamp)
 
 	if err == sql.ErrNoRows {
-		return nil, nil // Block not found
+		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to query block: %w", err)
@@ -90,57 +135,168 @@ func (s *Store) GetBlock(ctx context.Context, height uint64) (*metadata.BlockMet
 
 	copy(meta.BlockHash[:], blockHash)
 	copy(meta.MerkleRoot[:], merkleRoot)
+	meta.Status = metadata.BlockStatus(status)
+	if timestamp.Valid {
+		meta.Timestamp = timestamp.Int64
+	}
 
 	return &meta, nil
 }
 
 // GetBlockByHash retrieves block metadata by block hash
 func (s *Store) GetBlockByHash(ctx context.Context, blockHash kvstore.Hash) (*metadata.BlockMeta, error) {
-	var height uint64
+	var meta metadata.BlockMeta
+	var blockHashBytes, merkleRoot []byte
+	var status string
+	var timestamp sql.NullInt64
 
-	// First get the height
 	err := s.db.QueryRowContext(ctx,
-		`SELECT height FROM blocks WHERE block_hash = ?`,
+		`SELECT height, block_hash, merkle_root, tx_count, status, timestamp
+		 FROM blocks WHERE block_hash = ?`,
 		blockHash[:],
-	).Scan(&height)
+	).Scan(&meta.Height, &blockHashBytes, &merkleRoot, &meta.TxCount, &status, &timestamp)
 
 	if err == sql.ErrNoRows {
-		return nil, nil // Block not found
+		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to query block by hash: %w", err)
 	}
 
-	// Use GetBlock to get full metadata
-	return s.GetBlock(ctx, height)
+	copy(meta.BlockHash[:], blockHashBytes)
+	copy(meta.MerkleRoot[:], merkleRoot)
+	meta.Status = metadata.BlockStatus(status)
+	if timestamp.Valid {
+		meta.Timestamp = timestamp.Int64
+	}
+
+	return &meta, nil
 }
 
-// DeleteBlock removes block metadata (for reorg cleanup)
-func (s *Store) DeleteBlock(ctx context.Context, height uint64) error {
-	// CASCADE will delete subtrees automatically
-	_, err := s.db.ExecContext(ctx,
-		`DELETE FROM blocks WHERE height = ?`,
-		height,
-	)
-	return err
-}
-
-// GetLatestBlock returns the highest block height stored
-func (s *Store) GetLatestBlock(ctx context.Context) (*metadata.BlockMeta, error) {
-	var height uint64
+// GetBlockByMerkleRoot retrieves block metadata by merkle root
+func (s *Store) GetBlockByMerkleRoot(ctx context.Context, merkleRoot kvstore.Hash) (*metadata.BlockMeta, error) {
+	var meta metadata.BlockMeta
+	var blockHash, merkleRootBytes []byte
+	var status string
+	var timestamp sql.NullInt64
 
 	err := s.db.QueryRowContext(ctx,
-		`SELECT height FROM blocks ORDER BY height DESC LIMIT 1`,
-	).Scan(&height)
+		`SELECT height, block_hash, merkle_root, tx_count, status, timestamp
+		 FROM blocks WHERE merkle_root = ?`,
+		merkleRoot[:],
+	).Scan(&meta.Height, &blockHash, &merkleRootBytes, &meta.TxCount, &status, &timestamp)
 
 	if err == sql.ErrNoRows {
-		return nil, nil // No blocks stored
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to query block by merkle root: %w", err)
+	}
+
+	copy(meta.BlockHash[:], blockHash)
+	copy(meta.MerkleRoot[:], merkleRootBytes)
+	meta.Status = metadata.BlockStatus(status)
+	if timestamp.Valid {
+		meta.Timestamp = timestamp.Int64
+	}
+
+	return &meta, nil
+}
+
+// GetSubtrees retrieves all subtrees for a block, ordered by subtree_index
+func (s *Store) GetSubtrees(ctx context.Context, merkleRoot kvstore.Hash) ([]*metadata.SubtreeMeta, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT merkle_root, subtree_index, subtree_merkle_root, tx_count, index_root, tx_tree_root
+		 FROM subtrees WHERE merkle_root = ? ORDER BY subtree_index`,
+		merkleRoot[:],
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query subtrees: %w", err)
+	}
+	defer rows.Close()
+
+	var subtrees []*metadata.SubtreeMeta
+	for rows.Next() {
+		var subtree metadata.SubtreeMeta
+		var merkleRootBytes, subtreeMerkleRoot []byte
+
+		err := rows.Scan(&merkleRootBytes, &subtree.SubtreeIndex, &subtreeMerkleRoot,
+			&subtree.TxCount, &subtree.IndexRoot, &subtree.TxTreeRoot)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan subtree: %w", err)
+		}
+
+		copy(subtree.MerkleRoot[:], merkleRootBytes)
+		copy(subtree.SubtreeMerkleRoot[:], subtreeMerkleRoot)
+
+		subtrees = append(subtrees, &subtree)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating subtrees: %w", err)
+	}
+
+	return subtrees, nil
+}
+
+// MarkOrphan marks blocks at the given height as orphaned
+func (s *Store) MarkOrphan(ctx context.Context, height uint64) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE blocks SET status = 'orphan' WHERE height = ? AND status = 'main'`,
+		height,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to mark blocks as orphan: %w", err)
+	}
+	return nil
+}
+
+// CleanupOrphans removes orphaned blocks older than the given depth
+func (s *Store) CleanupOrphans(ctx context.Context, currentHeight uint64, depth uint64) error {
+	if currentHeight < depth {
+		return nil
+	}
+
+	cutoffHeight := currentHeight - depth
+
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM blocks WHERE status = 'orphan' AND height <= ?`,
+		cutoffHeight,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to cleanup orphans: %w", err)
+	}
+
+	return nil
+}
+
+// GetLatestBlock returns the highest main chain block
+func (s *Store) GetLatestBlock(ctx context.Context) (*metadata.BlockMeta, error) {
+	var meta metadata.BlockMeta
+	var blockHash, merkleRoot []byte
+	var status string
+	var timestamp sql.NullInt64
+
+	err := s.db.QueryRowContext(ctx,
+		`SELECT height, block_hash, merkle_root, tx_count, status, timestamp
+		 FROM blocks WHERE status = 'main' ORDER BY height DESC LIMIT 1`,
+	).Scan(&meta.Height, &blockHash, &merkleRoot, &meta.TxCount, &status, &timestamp)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to query latest block: %w", err)
 	}
 
-	return s.GetBlock(ctx, height)
+	copy(meta.BlockHash[:], blockHash)
+	copy(meta.MerkleRoot[:], merkleRoot)
+	meta.Status = metadata.BlockStatus(status)
+	if timestamp.Valid {
+		meta.Timestamp = timestamp.Int64
+	}
+
+	return &meta, nil
 }
 
 // Close releases all database resources
