@@ -56,7 +56,7 @@ func (b *implementation) BuildSubtreeIndex(
 
 	for key, valueMap := range indexMap {
 		// Create a leaf node for this key
-		leafNode := indexnode.NewIndexNode() // Mode 0: value keys, no data
+		leafNode := indexnode.NewIndexNode(32, 32, false, false, false)
 
 		// Sort values for deterministic ordering
 		values := make([]string, 0, len(valueMap))
@@ -75,7 +75,7 @@ func (b *implementation) BuildSubtreeIndex(
 			}
 
 			// Add entry: value → txid_list_hash
-			if err := leafNode.AddEntry([]byte(value), txidListHash[:], nil); err != nil {
+			if err := leafNode.AddEntry([]byte(value), txidListHash[:], 0); err != nil {
 				return kvstore.Hash{}, fmt.Errorf("failed to add entry to leaf node: %w", err)
 			}
 		}
@@ -95,7 +95,7 @@ func (b *implementation) BuildSubtreeIndex(
 	}
 
 	// Step 3: Build root node containing: indexed_key → leaf_node_hash
-	rootNode := indexnode.NewIndexNode() // Mode 0: value keys, no data
+	rootNode := indexnode.NewIndexNode(32, 32, false, false, false)
 
 	// Sort keys for deterministic ordering
 	keys := make([]string, 0, len(leafNodes))
@@ -106,7 +106,7 @@ func (b *implementation) BuildSubtreeIndex(
 
 	for _, key := range keys {
 		leafHash := leafNodes[key]
-		if err := rootNode.AddEntry([]byte(key), leafHash[:], nil); err != nil {
+		if err := rootNode.AddEntry([]byte(key), leafHash[:], 0); err != nil {
 			return kvstore.Hash{}, fmt.Errorf("failed to add entry to root node: %w", err)
 		}
 	}
@@ -134,8 +134,7 @@ func (b *implementation) BuildBlockSubtreeIndex(
 		return nil, fmt.Errorf("no subtrees to index")
 	}
 
-	// Create Mode 3 IndexNode: pointer keys (32 bytes), with data
-	node := indexnode.NewFixedKeyIndexNodeWithData(32)
+	node := indexnode.NewIndexNode(32, 32, true, false, false)
 
 	// Sort subtrees by merkle root for deterministic ordering
 	sortedSubtrees := make([]SubtreeInfo, len(subtrees))
@@ -144,13 +143,8 @@ func (b *implementation) BuildBlockSubtreeIndex(
 		return bytes.Compare(sortedSubtrees[i].MerkleRoot[:], sortedSubtrees[j].MerkleRoot[:]) < 0
 	})
 
-	// Add entries: subtree_merkle_root → index_root_hash, with tx_count as data
 	for _, subtree := range sortedSubtrees {
-		// Encode tx count as 4-byte big-endian uint32
-		txCountBytes := make([]byte, 4)
-		binary.BigEndian.PutUint32(txCountBytes, subtree.TxCount)
-
-		if err := node.AddEntry(subtree.MerkleRoot[:], subtree.IndexRootHash[:], txCountBytes); err != nil {
+		if err := node.AddEntry(subtree.MerkleRoot[:], subtree.IndexRootHash[:], subtree.TxCount); err != nil {
 			return nil, fmt.Errorf("failed to add subtree entry: %w", err)
 		}
 	}
