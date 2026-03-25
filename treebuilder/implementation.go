@@ -1,7 +1,6 @@
 package treebuilder
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -9,185 +8,152 @@ import (
 
 	"github.com/shruggr/inspiration/indexnode"
 	"github.com/shruggr/inspiration/kvstore"
-	"lukechampine.com/blake3"
+	"github.com/shruggr/inspiration/multihash"
 )
 
-// implementation is the concrete implementation of Builder
 type implementation struct {
 	store kvstore.KVStore
 }
 
-// NewBuilder creates a new tree builder
 func NewBuilder(store kvstore.KVStore) Builder {
-	return &implementation{
-		store: store,
-	}
+	return &implementation{store: store}
 }
 
-// BuildSubtreeIndex builds an index tree for a single subtree
-func (b *implementation) BuildSubtreeIndex(
-	ctx context.Context,
-	subtreeMerkleRoot kvstore.Hash,
-	txs []TransactionWithTerms,
-) (kvstore.Hash, error) {
+func (b *implementation) BuildSubtreeIndex(ctx context.Context, txs []TaggedTransaction) (multihash.IndexHash, error) {
 	if len(txs) == 0 {
-		return kvstore.Hash{}, fmt.Errorf("no transactions to index")
+		return nil, fmt.Errorf("no transactions to index")
 	}
 
-	// Step 1: Group transactions by indexed_key → indexed_value → []txid
-	// Map structure: key → value → list of txids
-	indexMap := make(map[string]map[string][]kvstore.Hash)
+	// Group by tag key -> tag value -> []LeafEntry
+	type leafGroup struct {
+		entries []indexnode.LeafEntry
+	}
+	keyMap := make(map[string]map[string]*leafGroup)
 
 	for _, tx := range txs {
-		for _, term := range tx.Terms {
-			keyStr := string(term.Key)
-			valueStr := string(term.Value)
-
-			if indexMap[keyStr] == nil {
-				indexMap[keyStr] = make(map[string][]kvstore.Hash)
+		for _, tag := range tx.Tags {
+			valueMap, ok := keyMap[tag.Key]
+			if !ok {
+				valueMap = make(map[string]*leafGroup)
+				keyMap[tag.Key] = valueMap
 			}
-			indexMap[keyStr][valueStr] = append(indexMap[keyStr][valueStr], tx.TxID)
+			group, ok := valueMap[tag.Value]
+			if !ok {
+				group = &leafGroup{}
+				valueMap[tag.Value] = group
+			}
+			group.entries = append(group.entries, indexnode.LeafEntry{
+				TxID:            tx.TxID[:],
+				SubtreePosition: tx.SubtreePosition,
+				Vouts:           tag.Vouts,
+			})
 		}
 	}
 
-	// Step 2: Build leaf nodes for each indexed_key
-	// Each leaf node contains: indexed_value → txid_list_hash
-	leafNodes := make(map[string]kvstore.Hash) // key → leaf node hash
+	// Level 2: for each tag key, build a tag-value node
+	keyToHash := make(map[string]multihash.IndexHash, len(keyMap))
 
-	for key, valueMap := range indexMap {
-		// Create a leaf node for this key
-		leafNode := indexnode.NewIndexNode(32, 32, false, false, false)
+	for key, valueMap := range keyMap {
+		valueNode := indexnode.NewTagNode()
+		var dataSection []byte
+		dataSection = append(dataSection, 0) // padding byte
 
-		// Sort values for deterministic ordering
 		values := make([]string, 0, len(valueMap))
-		for value := range valueMap {
-			values = append(values, value)
+		for v := range valueMap {
+			values = append(values, v)
 		}
 		sort.Strings(values)
 
-		for _, value := range values {
-			txidList := valueMap[value]
+		for _, val := range values {
+			group := valueMap[val]
 
-			// Create and store the txid list
-			txidListHash, err := b.storeTxIDList(ctx, txidList)
+			// Sort leaf entries by SubtreePosition
+			sort.Slice(group.entries, func(i, j int) bool {
+				return group.entries[i].SubtreePosition < group.entries[j].SubtreePosition
+			})
+
+			// Level 3: marshal leaf entry list, hash, store
+			leafBytes := indexnode.MarshalLeafEntryList(group.entries)
+			leafHash, err := multihash.NewIndexHash(leafBytes)
 			if err != nil {
-				return kvstore.Hash{}, fmt.Errorf("failed to store txid list: %w", err)
+				return nil, fmt.Errorf("hash leaf list: %w", err)
+			}
+			if err := b.store.Put(ctx, leafHash.Bytes(), leafBytes); err != nil {
+				return nil, fmt.Errorf("store leaf list: %w", err)
 			}
 
-			// Add entry: value → txid_list_hash
-			if err := leafNode.AddEntry([]byte(value), txidListHash[:], 0); err != nil {
-				return kvstore.Hash{}, fmt.Errorf("failed to add entry to leaf node: %w", err)
+			// Add entry to value node
+			offset := uint32(len(dataSection))
+			dataSection = appendLengthPrefixed(dataSection, val)
+			if err := valueNode.AddEntry(nil, leafHash.Bytes()[2:], offset); err != nil {
+				return nil, fmt.Errorf("add value entry: %w", err)
 			}
 		}
 
-		// Marshal and store the leaf node
-		leafNodeBytes, err := leafNode.Marshal()
+		valueNode.SetDataSection(dataSection)
+		if err := valueNode.Sort(); err != nil {
+			return nil, fmt.Errorf("sort value node: %w", err)
+		}
+
+		valueBytes, err := valueNode.Marshal()
 		if err != nil {
-			return kvstore.Hash{}, fmt.Errorf("failed to marshal leaf node: %w", err)
+			return nil, fmt.Errorf("marshal value node: %w", err)
+		}
+		valueHash, err := multihash.NewIndexHash(valueBytes)
+		if err != nil {
+			return nil, fmt.Errorf("hash value node: %w", err)
+		}
+		if err := b.store.Put(ctx, valueHash.Bytes(), valueBytes); err != nil {
+			return nil, fmt.Errorf("store value node: %w", err)
 		}
 
-		leafNodeHash := hashNode(leafNodeBytes)
-		if err := b.store.Put(ctx, leafNodeHash[:], leafNodeBytes); err != nil {
-			return kvstore.Hash{}, fmt.Errorf("failed to store leaf node: %w", err)
-		}
-
-		leafNodes[key] = leafNodeHash
+		keyToHash[key] = valueHash
 	}
 
-	// Step 3: Build root node containing: indexed_key → leaf_node_hash
-	rootNode := indexnode.NewIndexNode(32, 32, false, false, false)
+	// Level 1: build root tag-key node
+	rootNode := indexnode.NewTagNode()
+	var rootData []byte
+	rootData = append(rootData, 0) // padding byte
 
-	// Sort keys for deterministic ordering
-	keys := make([]string, 0, len(leafNodes))
-	for key := range leafNodes {
-		keys = append(keys, key)
+	keys := make([]string, 0, len(keyToHash))
+	for k := range keyToHash {
+		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 
 	for _, key := range keys {
-		leafHash := leafNodes[key]
-		if err := rootNode.AddEntry([]byte(key), leafHash[:], 0); err != nil {
-			return kvstore.Hash{}, fmt.Errorf("failed to add entry to root node: %w", err)
+		h := keyToHash[key]
+		offset := uint32(len(rootData))
+		rootData = appendLengthPrefixed(rootData, key)
+		if err := rootNode.AddEntry(nil, h.Bytes()[2:], offset); err != nil {
+			return nil, fmt.Errorf("add key entry: %w", err)
 		}
 	}
 
-	// Marshal and store root node
-	rootNodeBytes, err := rootNode.Marshal()
-	if err != nil {
-		return kvstore.Hash{}, fmt.Errorf("failed to marshal root node: %w", err)
+	rootNode.SetDataSection(rootData)
+	if err := rootNode.Sort(); err != nil {
+		return nil, fmt.Errorf("sort root node: %w", err)
 	}
 
-	rootHash := hashNode(rootNodeBytes)
-	if err := b.store.Put(ctx, rootHash[:], rootNodeBytes); err != nil {
-		return kvstore.Hash{}, fmt.Errorf("failed to store root node: %w", err)
+	rootBytes, err := rootNode.Marshal()
+	if err != nil {
+		return nil, fmt.Errorf("marshal root node: %w", err)
+	}
+	rootHash, err := multihash.NewIndexHash(rootBytes)
+	if err != nil {
+		return nil, fmt.Errorf("hash root node: %w", err)
+	}
+	if err := b.store.Put(ctx, rootHash.Bytes(), rootBytes); err != nil {
+		return nil, fmt.Errorf("store root node: %w", err)
 	}
 
 	return rootHash, nil
 }
 
-// BuildBlockSubtreeIndex builds the block→subtree mapping
-func (b *implementation) BuildBlockSubtreeIndex(
-	ctx context.Context,
-	subtrees []SubtreeInfo,
-) ([]byte, error) {
-	if len(subtrees) == 0 {
-		return nil, fmt.Errorf("no subtrees to index")
-	}
-
-	node := indexnode.NewIndexNode(32, 32, true, false, false)
-
-	// Sort subtrees by merkle root for deterministic ordering
-	sortedSubtrees := make([]SubtreeInfo, len(subtrees))
-	copy(sortedSubtrees, subtrees)
-	sort.Slice(sortedSubtrees, func(i, j int) bool {
-		return bytes.Compare(sortedSubtrees[i].MerkleRoot[:], sortedSubtrees[j].MerkleRoot[:]) < 0
-	})
-
-	for _, subtree := range sortedSubtrees {
-		if err := node.AddEntry(subtree.MerkleRoot[:], subtree.IndexRootHash[:], subtree.TxCount); err != nil {
-			return nil, fmt.Errorf("failed to add subtree entry: %w", err)
-		}
-	}
-
-	// Marshal the node
-	nodeBytes, err := node.Marshal()
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal block subtree index: %w", err)
-	}
-
-	return nodeBytes, nil
-}
-
-// storeTxIDList stores a list of transaction IDs and returns the BLAKE3 hash
-func (b *implementation) storeTxIDList(ctx context.Context, txids []kvstore.Hash) (kvstore.Hash, error) {
-	// Sort txids for deterministic ordering
-	sortedTxids := make([]kvstore.Hash, len(txids))
-	copy(sortedTxids, txids)
-	sort.Slice(sortedTxids, func(i, j int) bool {
-		return bytes.Compare(sortedTxids[i][:], sortedTxids[j][:]) < 0
-	})
-
-	// Serialize: count (4 bytes) + concatenated txids
-	buf := make([]byte, 4+len(sortedTxids)*32)
-	binary.BigEndian.PutUint32(buf[0:4], uint32(len(sortedTxids)))
-
-	offset := 4
-	for _, txid := range sortedTxids {
-		copy(buf[offset:offset+32], txid[:])
-		offset += 32
-	}
-
-	// Hash and store
-	hash := hashNode(buf)
-	if err := b.store.Put(ctx, hash[:], buf); err != nil {
-		return kvstore.Hash{}, err
-	}
-
-	return hash, nil
-}
-
-// hashNode computes the BLAKE3 hash of node data
-func hashNode(data []byte) kvstore.Hash {
-	h := blake3.Sum256(data)
-	return h
+func appendLengthPrefixed(buf []byte, s string) []byte {
+	lenBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(lenBuf, uint32(len(s)))
+	buf = append(buf, lenBuf...)
+	buf = append(buf, s...)
+	return buf
 }
