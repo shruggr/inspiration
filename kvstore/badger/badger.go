@@ -85,6 +85,18 @@ func (s *Store) Delete(ctx context.Context, key []byte) error {
 	})
 }
 
+// Has checks whether a key exists
+func (s *Store) Has(_ context.Context, key []byte) (bool, error) {
+	err := s.db.View(func(txn *badger.Txn) error {
+		_, err := txn.Get(key)
+		return err
+	})
+	if err == badger.ErrKeyNotFound {
+		return false, nil
+	}
+	return err == nil, err
+}
+
 // Close releases all BadgerDB resources
 func (s *Store) Close() error {
 	if s.db != nil {

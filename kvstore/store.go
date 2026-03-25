@@ -25,6 +25,9 @@ type KVStore interface {
 	// Delete removes a key-value pair
 	Delete(ctx context.Context, key []byte) error
 
+	// Has checks whether a key exists
+	Has(ctx context.Context, key []byte) (bool, error)
+
 	// Close releases any resources
 	Close() error
 }
