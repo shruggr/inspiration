@@ -1,258 +1,205 @@
 package sqlite
 
 import (
+	"bytes"
 	"context"
-	"os"
 	"testing"
-
-	"github.com/shruggr/inspiration/kvstore"
-	"github.com/shruggr/inspiration/metadata"
 )
 
-func TestPutAndGetBlock(t *testing.T) {
-	tmpFile := "/tmp/test_metadata.db"
-	defer os.Remove(tmpFile)
-
-	store, err := New(&Config{DBPath: tmpFile})
+func newTestStore(t *testing.T) *SQLiteStore {
+	t.Helper()
+	s, err := New(":memory:")
 	if err != nil {
-		t.Fatalf("Failed to create store: %v", err)
+		t.Fatalf("failed to create store: %v", err)
 	}
-	defer store.Close()
+	t.Cleanup(func() { s.Close() })
+	return s
+}
 
+func TestInsertAndGetSubtree(t *testing.T) {
+	s := newTestStore(t)
 	ctx := context.Background()
 
-	block := &metadata.BlockMeta{
-		Height:     100,
-		BlockHash:  kvstore.Hash{1, 2, 3},
-		MerkleRoot: kvstore.Hash{4, 5, 6},
-		TxCount:    50,
-		Status:     metadata.StatusMain,
-		Timestamp:  1234567890,
+	hash := []byte{1, 2, 3, 4}
+	indexRoot := []byte{10, 11, 12, 13}
+
+	if err := s.InsertSubtree(ctx, hash, indexRoot, 50); err != nil {
+		t.Fatalf("InsertSubtree failed: %v", err)
 	}
 
-	subtrees := []*metadata.SubtreeMeta{
-		{
-			MerkleRoot:        kvstore.Hash{4, 5, 6},
-			SubtreeIndex:      0,
-			SubtreeMerkleRoot: kvstore.Hash{7, 8, 9},
-			TxCount:           25,
-			IndexRoot:         []byte{10, 11, 12},
-			TxTreeRoot:        []byte{13, 14, 15},
-		},
-		{
-			MerkleRoot:        kvstore.Hash{4, 5, 6},
-			SubtreeIndex:      1,
-			SubtreeMerkleRoot: kvstore.Hash{16, 17, 18},
-			TxCount:           25,
-			IndexRoot:         []byte{19, 20, 21},
-			TxTreeRoot:        []byte{22, 23, 24},
-		},
-	}
-
-	if err := store.PutBlock(ctx, block, subtrees); err != nil {
-		t.Fatalf("PutBlock failed: %v", err)
-	}
-
-	retrieved, err := store.GetBlock(ctx, 100)
+	got, err := s.GetSubtreeIndexRoot(ctx, hash)
 	if err != nil {
-		t.Fatalf("GetBlock failed: %v", err)
+		t.Fatalf("GetSubtreeIndexRoot failed: %v", err)
+	}
+	if !bytes.Equal(got, indexRoot) {
+		t.Errorf("index root mismatch: got %v, want %v", got, indexRoot)
 	}
 
-	if retrieved == nil {
-		t.Fatal("GetBlock returned nil")
+	got, err = s.GetSubtreeIndexRoot(ctx, []byte{99, 99})
+	if err != nil {
+		t.Fatalf("GetSubtreeIndexRoot for missing key failed: %v", err)
 	}
-
-	if retrieved.Height != block.Height {
-		t.Errorf("Height mismatch: expected %d, got %d", block.Height, retrieved.Height)
-	}
-
-	if retrieved.TxCount != block.TxCount {
-		t.Errorf("TxCount mismatch: expected %d, got %d", block.TxCount, retrieved.TxCount)
-	}
-
-	if retrieved.Status != metadata.StatusMain {
-		t.Errorf("Status mismatch: expected %s, got %s", metadata.StatusMain, retrieved.Status)
+	if got != nil {
+		t.Errorf("expected nil for missing subtree, got %v", got)
 	}
 }
 
-func TestGetSubtrees(t *testing.T) {
-	tmpFile := "/tmp/test_subtrees.db"
-	defer os.Remove(tmpFile)
-
-	store, err := New(&Config{DBPath: tmpFile})
-	if err != nil {
-		t.Fatalf("Failed to create store: %v", err)
-	}
-	defer store.Close()
-
+func TestInsertBlockWithSubtrees(t *testing.T) {
+	s := newTestStore(t)
 	ctx := context.Background()
 
-	merkleRoot := kvstore.Hash{4, 5, 6}
+	sh1 := []byte{1, 1, 1}
+	sh2 := []byte{2, 2, 2}
+	sh3 := []byte{3, 3, 3}
 
-	block := &metadata.BlockMeta{
-		Height:     100,
-		BlockHash:  kvstore.Hash{1, 2, 3},
-		MerkleRoot: merkleRoot,
-		TxCount:    100,
-		Status:     metadata.StatusMain,
-		Timestamp:  1234567890,
-	}
-
-	subtrees := []*metadata.SubtreeMeta{
-		{
-			MerkleRoot:        merkleRoot,
-			SubtreeIndex:      0,
-			SubtreeMerkleRoot: kvstore.Hash{7, 8, 9},
-			TxCount:           50,
-			IndexRoot:         []byte{10, 11, 12},
-			TxTreeRoot:        []byte{13, 14, 15},
-		},
-		{
-			MerkleRoot:        merkleRoot,
-			SubtreeIndex:      1,
-			SubtreeMerkleRoot: kvstore.Hash{16, 17, 18},
-			TxCount:           50,
-			IndexRoot:         []byte{19, 20, 21},
-			TxTreeRoot:        []byte{22, 23, 24},
-		},
-	}
-
-	if err := store.PutBlock(ctx, block, subtrees); err != nil {
-		t.Fatalf("PutBlock failed: %v", err)
-	}
-
-	retrieved, err := store.GetSubtrees(ctx, merkleRoot)
-	if err != nil {
-		t.Fatalf("GetSubtrees failed: %v", err)
-	}
-
-	if len(retrieved) != 2 {
-		t.Fatalf("Expected 2 subtrees, got %d", len(retrieved))
-	}
-
-	if retrieved[0].SubtreeIndex != 0 {
-		t.Errorf("First subtree index should be 0, got %d", retrieved[0].SubtreeIndex)
-	}
-
-	if retrieved[1].SubtreeIndex != 1 {
-		t.Errorf("Second subtree index should be 1, got %d", retrieved[1].SubtreeIndex)
-	}
-}
-
-func TestMarkOrphan(t *testing.T) {
-	tmpFile := "/tmp/test_orphan.db"
-	defer os.Remove(tmpFile)
-
-	store, err := New(&Config{DBPath: tmpFile})
-	if err != nil {
-		t.Fatalf("Failed to create store: %v", err)
-	}
-	defer store.Close()
-
-	ctx := context.Background()
-
-	block := &metadata.BlockMeta{
-		Height:     100,
-		BlockHash:  kvstore.Hash{1, 2, 3},
-		MerkleRoot: kvstore.Hash{4, 5, 6},
-		TxCount:    50,
-		Status:     metadata.StatusMain,
-		Timestamp:  1234567890,
-	}
-
-	if err := store.PutBlock(ctx, block, nil); err != nil {
-		t.Fatalf("PutBlock failed: %v", err)
-	}
-
-	if err := store.MarkOrphan(ctx, 100); err != nil {
-		t.Fatalf("MarkOrphan failed: %v", err)
-	}
-
-	retrieved, err := store.GetBlockByMerkleRoot(ctx, kvstore.Hash{4, 5, 6})
-	if err != nil {
-		t.Fatalf("GetBlockByMerkleRoot failed: %v", err)
-	}
-
-	if retrieved.Status != metadata.StatusOrphan {
-		t.Errorf("Status should be orphan, got %s", retrieved.Status)
-	}
-}
-
-func TestCleanupOrphans(t *testing.T) {
-	tmpFile := "/tmp/test_cleanup.db"
-	defer os.Remove(tmpFile)
-
-	store, err := New(&Config{DBPath: tmpFile})
-	if err != nil {
-		t.Fatalf("Failed to create store: %v", err)
-	}
-	defer store.Close()
-
-	ctx := context.Background()
-
-	orphanBlock := &metadata.BlockMeta{
-		Height:     50,
-		BlockHash:  kvstore.Hash{1, 2, 3},
-		MerkleRoot: kvstore.Hash{4, 5, 6},
-		TxCount:    25,
-		Status:     metadata.StatusOrphan,
-		Timestamp:  1234567890,
-	}
-
-	if err := store.PutBlock(ctx, orphanBlock, nil); err != nil {
-		t.Fatalf("PutBlock failed: %v", err)
-	}
-
-	if err := store.CleanupOrphans(ctx, 200, 100); err != nil {
-		t.Fatalf("CleanupOrphans failed: %v", err)
-	}
-
-	retrieved, err := store.GetBlockByMerkleRoot(ctx, kvstore.Hash{4, 5, 6})
-	if err != nil {
-		t.Fatalf("GetBlockByMerkleRoot failed: %v", err)
-	}
-
-	if retrieved != nil {
-		t.Error("Old orphan block should have been deleted")
-	}
-}
-
-func TestGetLatestBlock(t *testing.T) {
-	tmpFile := "/tmp/test_latest.db"
-	defer os.Remove(tmpFile)
-
-	store, err := New(&Config{DBPath: tmpFile})
-	if err != nil {
-		t.Fatalf("Failed to create store: %v", err)
-	}
-	defer store.Close()
-
-	ctx := context.Background()
-
-	for i := uint64(1); i <= 5; i++ {
-		block := &metadata.BlockMeta{
-			Height:     i,
-			BlockHash:  kvstore.Hash{byte(i), 0, 0},
-			MerkleRoot: kvstore.Hash{0, byte(i), 0},
-			TxCount:    10,
-			Status:     metadata.StatusMain,
-			Timestamp:  int64(i),
-		}
-		if err := store.PutBlock(ctx, block, nil); err != nil {
-			t.Fatalf("PutBlock failed: %v", err)
+	for _, sh := range [][]byte{sh1, sh2, sh3} {
+		if err := s.InsertSubtree(ctx, sh, []byte{0xAA}, 10); err != nil {
+			t.Fatalf("InsertSubtree failed: %v", err)
 		}
 	}
 
-	latest, err := store.GetLatestBlock(ctx)
+	blockHash := []byte{0xBB, 0xCC}
+	header := []byte{0xDD, 0xEE}
+	subtreeHashes := [][]byte{sh1, sh2, sh3}
+
+	if err := s.InsertBlock(ctx, 100, blockHash, header, 30, subtreeHashes); err != nil {
+		t.Fatalf("InsertBlock failed: %v", err)
+	}
+
+	got, err := s.GetBlockSubtrees(ctx, blockHash)
 	if err != nil {
-		t.Fatalf("GetLatestBlock failed: %v", err)
+		t.Fatalf("GetBlockSubtrees failed: %v", err)
 	}
 
-	if latest == nil {
-		t.Fatal("GetLatestBlock returned nil")
+	if len(got) != 3 {
+		t.Fatalf("expected 3 subtrees, got %d", len(got))
+	}
+	for i, want := range subtreeHashes {
+		if !bytes.Equal(got[i], want) {
+			t.Errorf("subtree %d mismatch: got %v, want %v", i, got[i], want)
+		}
+	}
+}
+
+func TestSubtreeExists(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	hash := []byte{5, 6, 7}
+
+	exists, err := s.SubtreeExists(ctx, hash)
+	if err != nil {
+		t.Fatalf("SubtreeExists failed: %v", err)
+	}
+	if exists {
+		t.Error("expected false before insert")
 	}
 
-	if latest.Height != 5 {
-		t.Errorf("Expected height 5, got %d", latest.Height)
+	if err := s.InsertSubtree(ctx, hash, []byte{0xAA}, 5); err != nil {
+		t.Fatalf("InsertSubtree failed: %v", err)
+	}
+
+	exists, err = s.SubtreeExists(ctx, hash)
+	if err != nil {
+		t.Fatalf("SubtreeExists failed: %v", err)
+	}
+	if !exists {
+		t.Error("expected true after insert")
+	}
+}
+
+func TestPromoteBlock(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	sh := []byte{1, 2}
+	if err := s.InsertSubtree(ctx, sh, []byte{0xAA}, 10); err != nil {
+		t.Fatalf("InsertSubtree failed: %v", err)
+	}
+
+	blockHash := []byte{0xBB}
+	if err := s.InsertBlock(ctx, 100, blockHash, []byte{0xCC}, 10, [][]byte{sh}); err != nil {
+		t.Fatalf("InsertBlock failed: %v", err)
+	}
+
+	if err := s.PromoteBlock(ctx, blockHash); err != nil {
+		t.Fatalf("PromoteBlock failed: %v", err)
+	}
+
+	var status string
+	err := s.db.QueryRowContext(ctx, `SELECT status FROM blocks WHERE block_hash = ?`, blockHash).Scan(&status)
+	if err != nil {
+		t.Fatalf("query status failed: %v", err)
+	}
+	if status != "confirmed" {
+		t.Errorf("expected status 'confirmed', got %q", status)
+	}
+
+	var promoted int
+	var linkedBlock []byte
+	err = s.db.QueryRowContext(ctx, `SELECT promoted, block_hash FROM subtrees WHERE subtree_hash = ?`, sh).Scan(&promoted, &linkedBlock)
+	if err != nil {
+		t.Fatalf("query subtree failed: %v", err)
+	}
+	if promoted != 1 {
+		t.Errorf("expected promoted=1, got %d", promoted)
+	}
+	if !bytes.Equal(linkedBlock, blockHash) {
+		t.Errorf("expected subtree block_hash=%v, got %v", blockHash, linkedBlock)
+	}
+}
+
+func TestOrphanBlock(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	blockHash := []byte{0xAA}
+	if err := s.InsertBlock(ctx, 50, blockHash, []byte{0xBB}, 5, nil); err != nil {
+		t.Fatalf("InsertBlock failed: %v", err)
+	}
+
+	if err := s.OrphanBlock(ctx, blockHash); err != nil {
+		t.Fatalf("OrphanBlock failed: %v", err)
+	}
+
+	var status string
+	err := s.db.QueryRowContext(ctx, `SELECT status FROM blocks WHERE block_hash = ?`, blockHash).Scan(&status)
+	if err != nil {
+		t.Fatalf("query status failed: %v", err)
+	}
+	if status != "orphaned" {
+		t.Errorf("expected status 'orphaned', got %q", status)
+	}
+}
+
+func TestGetUnpromotedBlocks(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	for i := uint32(1); i <= 5; i++ {
+		if err := s.InsertBlock(ctx, i*10, []byte{byte(i)}, []byte{0xFF}, uint64(i), nil); err != nil {
+			t.Fatalf("InsertBlock failed: %v", err)
+		}
+	}
+
+	// Promote the block at height 30
+	if err := s.PromoteBlock(ctx, []byte{3}); err != nil {
+		t.Fatalf("PromoteBlock failed: %v", err)
+	}
+
+	got, err := s.GetUnpromotedBlocks(ctx, 30)
+	if err != nil {
+		t.Fatalf("GetUnpromotedBlocks failed: %v", err)
+	}
+
+	// Heights 10, 20 are pending and <= 30. Height 30 is confirmed so excluded.
+	if len(got) != 2 {
+		t.Fatalf("expected 2 unpromoted blocks, got %d", len(got))
+	}
+	if !bytes.Equal(got[0], []byte{1}) {
+		t.Errorf("first block hash mismatch: got %v", got[0])
+	}
+	if !bytes.Equal(got[1], []byte{2}) {
+		t.Errorf("second block hash mismatch: got %v", got[1])
 	}
 }

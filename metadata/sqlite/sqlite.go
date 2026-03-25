@@ -6,79 +6,78 @@ import (
 	"fmt"
 
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/shruggr/inspiration/kvstore"
-	"github.com/shruggr/inspiration/metadata"
 )
 
-// Store is a SQLite-backed implementation of metadata.Store
-type Store struct {
+type SQLiteStore struct {
 	db *sql.DB
 }
 
-// Config holds configuration for SQLite
-type Config struct {
-	DBPath string // Path to SQLite database file
-}
-
-// New creates a new SQLite-backed metadata store
-func New(config *Config) (*Store, error) {
-	if config.DBPath == "" {
-		return nil, fmt.Errorf("DBPath is required")
-	}
-
-	db, err := sql.Open("sqlite3", config.DBPath)
+func New(dbPath string) (*SQLiteStore, error) {
+	db, err := sql.Open("sqlite3", dbPath+"?_foreign_keys=on")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite db: %w", err)
 	}
 
-	store := &Store{db: db}
+	if _, err := db.Exec("PRAGMA foreign_keys = ON"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to enable foreign keys: %w", err)
+	}
 
-	// Initialize schema
-	if err := store.initSchema(); err != nil {
+	s := &SQLiteStore{db: db}
+	if err := s.initSchema(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to initialize schema: %w", err)
 	}
 
-	return store, nil
+	return s, nil
 }
 
-// initSchema creates the necessary tables
-func (s *Store) initSchema() error {
+func (s *SQLiteStore) initSchema() error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS blocks (
-		height       INTEGER NOT NULL,
-		block_hash   BLOB NOT NULL,
-		merkle_root  BLOB PRIMARY KEY,
-		tx_count     INTEGER NOT NULL,
-		status       TEXT NOT NULL DEFAULT 'main',
-		timestamp    INTEGER,
-		created_at   INTEGER DEFAULT (strftime('%s', 'now'))
+		height          INTEGER NOT NULL,
+		block_hash      BLOB NOT NULL PRIMARY KEY,
+		header          BLOB NOT NULL,
+		tx_count        INTEGER NOT NULL,
+		subtree_count   INTEGER NOT NULL,
+		index_root      BLOB,
+		status          TEXT NOT NULL DEFAULT 'pending',
+		created_at      INTEGER DEFAULT (strftime('%s', 'now')),
+		promoted_at     INTEGER
 	);
+	CREATE INDEX IF NOT EXISTS idx_blocks_height ON blocks(height);
+	CREATE INDEX IF NOT EXISTS idx_blocks_status ON blocks(status);
 
-	CREATE INDEX IF NOT EXISTS idx_blocks_status_height ON blocks(status, height);
-	CREATE UNIQUE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(block_hash);
+	CREATE TABLE IF NOT EXISTS block_subtrees (
+		block_hash      BLOB NOT NULL,
+		subtree_index   INTEGER NOT NULL,
+		subtree_hash    BLOB NOT NULL,
+		PRIMARY KEY (block_hash, subtree_index),
+		FOREIGN KEY (block_hash) REFERENCES blocks(block_hash) ON DELETE CASCADE
+	);
 
 	CREATE TABLE IF NOT EXISTS subtrees (
-		merkle_root         BLOB NOT NULL,
-		subtree_index       INTEGER NOT NULL,
-		subtree_merkle_root BLOB NOT NULL,
-		tx_count            INTEGER NOT NULL,
-		index_root          BLOB NOT NULL,
-		tx_tree_root        BLOB NOT NULL,
-
-		PRIMARY KEY (merkle_root, subtree_index),
-		FOREIGN KEY (merkle_root) REFERENCES blocks(merkle_root) ON DELETE CASCADE
+		subtree_hash    BLOB PRIMARY KEY,
+		index_root      BLOB NOT NULL,
+		tx_count        INTEGER NOT NULL,
+		received_at     INTEGER DEFAULT (strftime('%s', 'now')),
+		block_hash      BLOB,
+		promoted        INTEGER DEFAULT 0
 	);
-
-	CREATE INDEX IF NOT EXISTS idx_subtrees_merkle_root_subtree_index ON subtrees(merkle_root, subtree_index);
 	`
-
 	_, err := s.db.Exec(schema)
 	return err
 }
 
-// PutBlock stores block metadata with associated subtrees atomically
-func (s *Store) PutBlock(ctx context.Context, block *metadata.BlockMeta, subtrees []*metadata.SubtreeMeta) error {
+func (s *SQLiteStore) InsertSubtree(ctx context.Context, hash, indexRoot []byte, txCount uint32) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT OR REPLACE INTO subtrees (subtree_hash, index_root, tx_count) VALUES (?, ?, ?)`,
+		hash, indexRoot, txCount,
+	)
+	return err
+}
+
+func (s *SQLiteStore) InsertBlock(ctx context.Context, height uint32, blockHash, header []byte, txCount uint64, subtreeHashes [][]byte) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
@@ -86,224 +85,132 @@ func (s *Store) PutBlock(ctx context.Context, block *metadata.BlockMeta, subtree
 	defer tx.Rollback()
 
 	_, err = tx.ExecContext(ctx,
-		`INSERT OR REPLACE INTO blocks (height, block_hash, merkle_root, tx_count, status, timestamp)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		block.Height, block.BlockHash[:], block.MerkleRoot[:], block.TxCount, string(block.Status), block.Timestamp,
+		`INSERT INTO blocks (height, block_hash, header, tx_count, subtree_count) VALUES (?, ?, ?, ?, ?)`,
+		height, blockHash, header, txCount, len(subtreeHashes),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to insert block: %w", err)
 	}
 
-	for _, subtree := range subtrees {
+	for i, sh := range subtreeHashes {
 		_, err = tx.ExecContext(ctx,
-			`INSERT INTO subtrees (merkle_root, subtree_index, subtree_merkle_root, tx_count, index_root, tx_tree_root)
-			 VALUES (?, ?, ?, ?, ?, ?)`,
-			subtree.MerkleRoot[:], subtree.SubtreeIndex, subtree.SubtreeMerkleRoot[:],
-			subtree.TxCount, subtree.IndexRoot, subtree.TxTreeRoot,
+			`INSERT INTO block_subtrees (block_hash, subtree_index, subtree_hash) VALUES (?, ?, ?)`,
+			blockHash, i, sh,
 		)
 		if err != nil {
-			return fmt.Errorf("failed to insert subtree %d: %w", subtree.SubtreeIndex, err)
+			return fmt.Errorf("failed to insert block_subtree %d: %w", i, err)
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	return nil
+	return tx.Commit()
 }
 
-// GetBlock retrieves block metadata by height
-func (s *Store) GetBlock(ctx context.Context, height uint64) (*metadata.BlockMeta, error) {
-	var meta metadata.BlockMeta
-	var blockHash, merkleRoot []byte
-	var status string
-	var timestamp sql.NullInt64
-
-	err := s.db.QueryRowContext(ctx,
-		`SELECT height, block_hash, merkle_root, tx_count, status, timestamp
-		 FROM blocks WHERE height = ? AND status = 'main'`,
-		height,
-	).Scan(&meta.Height, &blockHash, &merkleRoot, &meta.TxCount, &status, &timestamp)
-
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to query block: %w", err)
-	}
-
-	copy(meta.BlockHash[:], blockHash)
-	copy(meta.MerkleRoot[:], merkleRoot)
-	meta.Status = metadata.BlockStatus(status)
-	if timestamp.Valid {
-		meta.Timestamp = timestamp.Int64
-	}
-
-	return &meta, nil
-}
-
-// GetBlockByHash retrieves block metadata by block hash
-func (s *Store) GetBlockByHash(ctx context.Context, blockHash kvstore.Hash) (*metadata.BlockMeta, error) {
-	var meta metadata.BlockMeta
-	var blockHashBytes, merkleRoot []byte
-	var status string
-	var timestamp sql.NullInt64
-
-	err := s.db.QueryRowContext(ctx,
-		`SELECT height, block_hash, merkle_root, tx_count, status, timestamp
-		 FROM blocks WHERE block_hash = ?`,
-		blockHash[:],
-	).Scan(&meta.Height, &blockHashBytes, &merkleRoot, &meta.TxCount, &status, &timestamp)
-
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to query block by hash: %w", err)
-	}
-
-	copy(meta.BlockHash[:], blockHashBytes)
-	copy(meta.MerkleRoot[:], merkleRoot)
-	meta.Status = metadata.BlockStatus(status)
-	if timestamp.Valid {
-		meta.Timestamp = timestamp.Int64
-	}
-
-	return &meta, nil
-}
-
-// GetBlockByMerkleRoot retrieves block metadata by merkle root
-func (s *Store) GetBlockByMerkleRoot(ctx context.Context, merkleRoot kvstore.Hash) (*metadata.BlockMeta, error) {
-	var meta metadata.BlockMeta
-	var blockHash, merkleRootBytes []byte
-	var status string
-	var timestamp sql.NullInt64
-
-	err := s.db.QueryRowContext(ctx,
-		`SELECT height, block_hash, merkle_root, tx_count, status, timestamp
-		 FROM blocks WHERE merkle_root = ?`,
-		merkleRoot[:],
-	).Scan(&meta.Height, &blockHash, &merkleRootBytes, &meta.TxCount, &status, &timestamp)
-
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to query block by merkle root: %w", err)
-	}
-
-	copy(meta.BlockHash[:], blockHash)
-	copy(meta.MerkleRoot[:], merkleRootBytes)
-	meta.Status = metadata.BlockStatus(status)
-	if timestamp.Valid {
-		meta.Timestamp = timestamp.Int64
-	}
-
-	return &meta, nil
-}
-
-// GetSubtrees retrieves all subtrees for a block, ordered by subtree_index
-func (s *Store) GetSubtrees(ctx context.Context, merkleRoot kvstore.Hash) ([]*metadata.SubtreeMeta, error) {
+func (s *SQLiteStore) GetBlockSubtrees(ctx context.Context, blockHash []byte) ([][]byte, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT merkle_root, subtree_index, subtree_merkle_root, tx_count, index_root, tx_tree_root
-		 FROM subtrees WHERE merkle_root = ? ORDER BY subtree_index`,
-		merkleRoot[:],
+		`SELECT subtree_hash FROM block_subtrees WHERE block_hash = ? ORDER BY subtree_index`,
+		blockHash,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query subtrees: %w", err)
+		return nil, err
 	}
 	defer rows.Close()
 
-	var subtrees []*metadata.SubtreeMeta
+	var hashes [][]byte
 	for rows.Next() {
-		var subtree metadata.SubtreeMeta
-		var merkleRootBytes, subtreeMerkleRoot []byte
-
-		err := rows.Scan(&merkleRootBytes, &subtree.SubtreeIndex, &subtreeMerkleRoot,
-			&subtree.TxCount, &subtree.IndexRoot, &subtree.TxTreeRoot)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan subtree: %w", err)
+		var h []byte
+		if err := rows.Scan(&h); err != nil {
+			return nil, err
 		}
-
-		copy(subtree.MerkleRoot[:], merkleRootBytes)
-		copy(subtree.SubtreeMerkleRoot[:], subtreeMerkleRoot)
-
-		subtrees = append(subtrees, &subtree)
+		hashes = append(hashes, h)
 	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating subtrees: %w", err)
-	}
-
-	return subtrees, nil
+	return hashes, rows.Err()
 }
 
-// MarkOrphan marks blocks at the given height as orphaned
-func (s *Store) MarkOrphan(ctx context.Context, height uint64) error {
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE blocks SET status = 'orphan' WHERE height = ? AND status = 'main'`,
-		height,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to mark blocks as orphan: %w", err)
-	}
-	return nil
-}
-
-// CleanupOrphans removes orphaned blocks older than the given depth
-func (s *Store) CleanupOrphans(ctx context.Context, currentHeight uint64, depth uint64) error {
-	if currentHeight < depth {
-		return nil
-	}
-
-	cutoffHeight := currentHeight - depth
-
-	_, err := s.db.ExecContext(ctx,
-		`DELETE FROM blocks WHERE status = 'orphan' AND height <= ?`,
-		cutoffHeight,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to cleanup orphans: %w", err)
-	}
-
-	return nil
-}
-
-// GetLatestBlock returns the highest main chain block
-func (s *Store) GetLatestBlock(ctx context.Context) (*metadata.BlockMeta, error) {
-	var meta metadata.BlockMeta
-	var blockHash, merkleRoot []byte
-	var status string
-	var timestamp sql.NullInt64
-
+func (s *SQLiteStore) GetSubtreeIndexRoot(ctx context.Context, subtreeHash []byte) ([]byte, error) {
+	var indexRoot []byte
 	err := s.db.QueryRowContext(ctx,
-		`SELECT height, block_hash, merkle_root, tx_count, status, timestamp
-		 FROM blocks WHERE status = 'main' ORDER BY height DESC LIMIT 1`,
-	).Scan(&meta.Height, &blockHash, &merkleRoot, &meta.TxCount, &status, &timestamp)
-
+		`SELECT index_root FROM subtrees WHERE subtree_hash = ?`,
+		subtreeHash,
+	).Scan(&indexRoot)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to query latest block: %w", err)
-	}
-
-	copy(meta.BlockHash[:], blockHash)
-	copy(meta.MerkleRoot[:], merkleRoot)
-	meta.Status = metadata.BlockStatus(status)
-	if timestamp.Valid {
-		meta.Timestamp = timestamp.Int64
-	}
-
-	return &meta, nil
+	return indexRoot, err
 }
 
-// Close releases all database resources
-func (s *Store) Close() error {
+func (s *SQLiteStore) SubtreeExists(ctx context.Context, subtreeHash []byte) (bool, error) {
+	var exists int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT 1 FROM subtrees WHERE subtree_hash = ? LIMIT 1`,
+		subtreeHash,
+	).Scan(&exists)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *SQLiteStore) PromoteBlock(ctx context.Context, blockHash []byte) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(ctx,
+		`UPDATE blocks SET status = 'confirmed', promoted_at = strftime('%s', 'now') WHERE block_hash = ?`,
+		blockHash,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to promote block: %w", err)
+	}
+
+	_, err = tx.ExecContext(ctx,
+		`UPDATE subtrees SET promoted = 1, block_hash = ? WHERE subtree_hash IN (SELECT subtree_hash FROM block_subtrees WHERE block_hash = ?)`,
+		blockHash, blockHash,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to promote subtrees: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+func (s *SQLiteStore) OrphanBlock(ctx context.Context, blockHash []byte) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE blocks SET status = 'orphaned' WHERE block_hash = ?`,
+		blockHash,
+	)
+	return err
+}
+
+func (s *SQLiteStore) GetUnpromotedBlocks(ctx context.Context, deeperThanHeight uint32) ([][]byte, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT block_hash FROM blocks WHERE status = 'pending' AND height <= ? ORDER BY height`,
+		deeperThanHeight,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var hashes [][]byte
+	for rows.Next() {
+		var h []byte
+		if err := rows.Scan(&h); err != nil {
+			return nil, err
+		}
+		hashes = append(hashes, h)
+	}
+	return hashes, rows.Err()
+}
+
+func (s *SQLiteStore) Close() error {
 	if s.db != nil {
 		return s.db.Close()
 	}
 	return nil
 }
-
