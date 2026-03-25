@@ -439,6 +439,98 @@ func (n *IndexNode) GetByIndex(index int) ([]byte, bool) {
 	return n.Entries[index].Value, true
 }
 
+// NewTagNode creates a node for variable-length string keys (tag keys or tag values).
+// Keys stored in data section, sorted by data. Value is a 32-byte hash.
+func NewTagNode() *IndexNode {
+	return NewIndexNode(0, 32, true, true, false)
+}
+
+// NewFixedKeyNode creates a node for fixed-width keys (e.g. 32-byte hashes).
+func NewFixedKeyNode(keySize uint16) *IndexNode {
+	return NewIndexNode(keySize, 32, false, false, false)
+}
+
+// NewArrayNode creates a node for ordered values with no keys (index-based access).
+func NewArrayNode(valueSize uint8) *IndexNode {
+	return NewIndexNode(0, valueSize, false, false, false)
+}
+
+// ScanPrefix finds all entries whose sort key starts with the given prefix.
+// For SortByData nodes, searches the data section. For key-sorted nodes, searches keys.
+func (n *IndexNode) ScanPrefix(prefix []byte) [][]byte {
+	if len(n.Entries) == 0 || len(prefix) == 0 {
+		return nil
+	}
+
+	getSortKey := n.sortKeyFunc()
+	if getSortKey == nil {
+		return nil
+	}
+
+	// Binary search for first entry >= prefix
+	idx := sort.Search(len(n.Entries), func(i int) bool {
+		return bytes.Compare(getSortKey(i), prefix) >= 0
+	})
+
+	var results [][]byte
+	for idx < len(n.Entries) {
+		key := getSortKey(idx)
+		if len(key) < len(prefix) || !bytes.Equal(key[:len(prefix)], prefix) {
+			break
+		}
+		results = append(results, n.Entries[idx].Value)
+		idx++
+	}
+	return results
+}
+
+// ScanRange returns all values for entries with sort key >= start and < end.
+func (n *IndexNode) ScanRange(start, end []byte) [][]byte {
+	if len(n.Entries) == 0 {
+		return nil
+	}
+
+	getSortKey := n.sortKeyFunc()
+	if getSortKey == nil {
+		return nil
+	}
+
+	// Binary search for first entry >= start
+	idx := sort.Search(len(n.Entries), func(i int) bool {
+		return bytes.Compare(getSortKey(i), start) >= 0
+	})
+
+	var results [][]byte
+	for idx < len(n.Entries) {
+		key := getSortKey(idx)
+		if bytes.Compare(key, end) >= 0 {
+			break
+		}
+		results = append(results, n.Entries[idx].Value)
+		idx++
+	}
+	return results
+}
+
+// sortKeyFunc returns a function that retrieves the sort key for entry at index i,
+// based on the node's configuration.
+func (n *IndexNode) sortKeyFunc() func(i int) []byte {
+	if n.SortByData {
+		if !n.HasData {
+			return nil
+		}
+		return func(i int) []byte {
+			return n.getDataAt(n.Entries[i].Offset)
+		}
+	}
+	if n.KeySize == 0 {
+		return nil
+	}
+	return func(i int) []byte {
+		return n.Entries[i].Key
+	}
+}
+
 // Size returns the serialized size of the node
 func (n *IndexNode) Size() int {
 	entrySize := int(n.KeySize) + int(n.ValueSize)
