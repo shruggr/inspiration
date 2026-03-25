@@ -5,18 +5,17 @@ import (
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/shruggr/inspiration/cache"
-	"github.com/shruggr/inspiration/kvstore"
 )
 
 // Cache is an in-memory LRU cache for index terms
 type Cache struct {
-	lru *lru.Cache[kvstore.Hash, []cache.IndexTerm]
+	lru *lru.Cache[cache.TxID, []cache.IndexTerm]
 	mu  sync.RWMutex
 }
 
 // New creates a new in-memory LRU cache with the specified size
 func New(size int) (*Cache, error) {
-	l, err := lru.New[kvstore.Hash, []cache.IndexTerm](size)
+	l, err := lru.New[cache.TxID, []cache.IndexTerm](size)
 	if err != nil {
 		return nil, err
 	}
@@ -27,7 +26,7 @@ func New(size int) (*Cache, error) {
 }
 
 // Get retrieves cached index terms for a transaction
-func (c *Cache) Get(txid kvstore.Hash) ([]cache.IndexTerm, bool) {
+func (c *Cache) Get(txid cache.TxID) ([]cache.IndexTerm, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -35,7 +34,7 @@ func (c *Cache) Get(txid kvstore.Hash) ([]cache.IndexTerm, bool) {
 }
 
 // Put stores index terms for a transaction
-func (c *Cache) Put(txid kvstore.Hash, terms []cache.IndexTerm) error {
+func (c *Cache) Put(txid cache.TxID, terms []cache.IndexTerm) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -44,7 +43,7 @@ func (c *Cache) Put(txid kvstore.Hash, terms []cache.IndexTerm) error {
 }
 
 // Delete removes cached terms for a transaction
-func (c *Cache) Delete(txid kvstore.Hash) error {
+func (c *Cache) Delete(txid cache.TxID) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 

@@ -6,17 +6,15 @@ import (
 
 // IndexResult represents a key-value pair extracted from a transaction
 type IndexResult struct {
-	Key   []byte
-	Value []byte
+	Key   string
+	Value string
+	Vouts []uint32
 }
 
-// TransactionContext provides transaction data and metadata to indexers
+// TransactionContext provides transaction data to indexers
 type TransactionContext struct {
-	TxID         []byte
-	RawTx        []byte
-	BlockHeight  *uint64 // nil if unconfirmed (mempool)
-	SubtreeRoot  []byte  // nil if unconfirmed
-	SubtreeIndex *uint32 // nil if unconfirmed
+	TxID  []byte
+	RawTx []byte
 }
 
 // Indexer is the plugin interface for extracting index terms from transactions

@@ -1,13 +1,13 @@
 package cache
 
-import (
-	"github.com/shruggr/inspiration/kvstore"
-)
+// TxID is a 32-byte transaction identifier
+type TxID = [32]byte
 
 // IndexTerm represents a parsed index term from a transaction
 type IndexTerm struct {
-	Key   []byte
-	Value []byte
+	Key   string
+	Value string
+	Vouts []uint32
 }
 
 // IndexTermCache provides fast access to previously parsed transaction index terms
@@ -15,13 +15,13 @@ type IndexTerm struct {
 type IndexTermCache interface {
 	// Get retrieves cached index terms for a transaction
 	// Returns nil if not cached
-	Get(txid kvstore.Hash) ([]IndexTerm, bool)
+	Get(txid TxID) ([]IndexTerm, bool)
 
 	// Put stores index terms for a transaction
-	Put(txid kvstore.Hash, terms []IndexTerm) error
+	Put(txid TxID, terms []IndexTerm) error
 
 	// Delete removes cached terms for a transaction
-	Delete(txid kvstore.Hash) error
+	Delete(txid TxID) error
 
 	// Clear removes all cached entries
 	Clear() error
