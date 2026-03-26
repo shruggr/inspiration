@@ -11,7 +11,6 @@ require (
 	github.com/multiformats/go-multihash v0.2.3
 	github.com/segmentio/kafka-go v0.4.50
 	google.golang.org/protobuf v1.36.11
-	lukechampine.com/blake3 v1.4.1
 )
 
 require (
@@ -36,8 +35,5 @@ require (
 	golang.org/x/crypto v0.49.0 // indirect
 	golang.org/x/net v0.52.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect
+	lukechampine.com/blake3 v1.4.1 // indirect
 )
-
-replace github.com/bsv-blockchain/go-sdk => ../1sat/go-sdk
-
-replace github.com/bsv-blockchain/teranode => ../1sat/teranode
